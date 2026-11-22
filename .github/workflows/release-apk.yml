@@ -1,0 +1,83 @@
+name: Compilar y publicar APK (Android)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Versión del release (ej. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Compilar APK de Scanly
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Verificar tipos TypeScript
+        run: npx tsc --noEmit
+
+      - name: Generar proyecto nativo Android (Expo Prebuild)
+        env:
+          CI: '1'
+        run: npx expo prebuild --platform android --clean
+
+      - name: Compilar APK Release
+        working-directory: android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+
+      - name: Preparar archivo APK
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ github.event.inputs.tag }}"
+          fi
+          echo "RELEASE_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
+          cp android/app/build/outputs/apk/release/app-release.apk "Scanly-${TAG_NAME}.apk"
+
+      - name: Subir APK como artefacto de Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scanly-APK
+          path: Scanly-*.apk
+
+      - name: Publicar en GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Scanly ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          body: |
+            ## Scanly ${{ env.RELEASE_TAG }}
+
+            Descarga el archivo `Scanly-${{ env.RELEASE_TAG }}.apk` para instalar la aplicación en tu dispositivo Android.
+
+            - Escáner multipágina con Google ML Kit
+            - OCR 100% offline por bloques y texto completo
+            - Firmas digitales reutilizables con colocación libre
+            - Exportación a PDF sin marcas de agua con cifrado AES 128-bit
+          files: Scanly-*.apk
