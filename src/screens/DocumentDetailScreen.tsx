@@ -20,7 +20,6 @@ import {
   addPagesToDocument,
   addSignatureToPage,
   clearPageSignatures,
-  copyImageToPermanentStorage,
   deleteDocument,
   deletePage,
   deletePageSignature,
@@ -28,6 +27,7 @@ import {
   moveDocumentToFolder,
   renameDocument,
   reorderPages,
+  replacePageImage,
   updatePageSignature,
 } from '../storage/database';
 import type { DocumentDetail, Folder, PageSignaturePlacement } from '../types/models';
@@ -36,7 +36,9 @@ import { MoveFolderModal } from '../components/MoveFolderModal';
 import { OcrModal } from '../components/OcrModal';
 import { PlaceSignatureModal } from '../components/PlaceSignatureModal';
 import { ExportPdfModal } from '../components/ExportPdfModal';
+import { CropDocumentModal } from '../components/CropDocumentModal';
 import { EmptyStateIllustration } from '../components/EmptyStateIllustration';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 interface DocumentDetailScreenProps {
@@ -68,6 +70,7 @@ function InteractiveSignatureOverlay({
   const [xRatio, setXRatio] = useState(sig.xRatio);
   const [yRatio, setYRatio] = useState(sig.yRatio);
   const [widthRatio, setWidthRatio] = useState(sig.widthRatio);
+  const [sigAspect, setSigAspect] = useState(0.46); // height / width
 
   const stateRef = useRef({ xRatio, yRatio, widthRatio });
   stateRef.current = { xRatio, yRatio, widthRatio };
@@ -75,6 +78,9 @@ function InteractiveSignatureOverlay({
   const startRef = useRef({ x: sig.xRatio, y: sig.yRatio, w: sig.widthRatio });
   const boxRef = useRef({ width: boxWidth, height: boxHeight });
   boxRef.current = { width: boxWidth, height: boxHeight };
+
+  const aspectRef = useRef(sigAspect);
+  aspectRef.current = sigAspect;
 
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
@@ -86,6 +92,22 @@ function InteractiveSignatureOverlay({
     setYRatio(sig.yRatio);
     setWidthRatio(sig.widthRatio);
   }, [sig.id, sig.xRatio, sig.yRatio, sig.widthRatio]);
+
+  useEffect(() => {
+    let active = true;
+    Image.getSize(
+      sig.imageUri,
+      (w, h) => {
+        if (active && w > 0 && h > 0) {
+          setSigAspect(h / w);
+        }
+      },
+      () => {}
+    );
+    return () => {
+      active = false;
+    };
+  }, [sig.imageUri]);
 
   const dragResponder = useMemo(
     () =>
@@ -103,8 +125,11 @@ function InteractiveSignatureOverlay({
         onPanResponderMove: (_, g) => {
           const w = Math.max(1, boxRef.current.width);
           const h = Math.max(1, boxRef.current.height);
-          const nextX = Math.max(0.01, Math.min(0.96 - startRef.current.w, startRef.current.x + g.dx / w));
-          const nextY = Math.max(0.01, Math.min(0.9, startRef.current.y + g.dy / h));
+          const sigHRatio = (startRef.current.w * w * aspectRef.current) / h;
+          const maxX = Math.max(0.01, 0.99 - startRef.current.w);
+          const maxY = Math.max(0.01, 0.99 - sigHRatio);
+          const nextX = Math.max(0, Math.min(maxX, startRef.current.x + g.dx / w));
+          const nextY = Math.max(0, Math.min(maxY, startRef.current.y + g.dy / h));
           setXRatio(nextX);
           setYRatio(nextY);
         },
@@ -138,8 +163,8 @@ function InteractiveSignatureOverlay({
         onPanResponderMove: (_, g) => {
           const w = Math.max(1, boxRef.current.width);
           const nextW = Math.max(
-            0.14,
-            Math.min(0.82, Math.min(0.98 - startRef.current.x, startRef.current.w + g.dx / w))
+            0.12,
+            Math.min(0.85, Math.min(0.99 - startRef.current.x, startRef.current.w + g.dx / w))
           );
           setWidthRatio(nextW);
         },
@@ -153,7 +178,7 @@ function InteractiveSignatureOverlay({
   );
 
   const sigW = widthRatio * boxWidth;
-  const sigH = sigW * 0.46;
+  const sigH = sigW * sigAspect;
 
   return (
     <View
@@ -169,7 +194,7 @@ function InteractiveSignatureOverlay({
       ]}
     >
       <View {...dragResponder.panHandlers} style={styles.sigDragArea}>
-        <Image source={{ uri: sig.imageUri }} style={styles.sigImage} resizeMode="contain" />
+        <Image source={{ uri: sig.imageUri }} style={styles.sigImage} resizeMode="stretch" />
       </View>
 
       {selected && (
@@ -199,10 +224,13 @@ export function DocumentDetailScreen({
   onDataChanged,
 }: DocumentDetailScreenProps) {
   const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [doc, setDoc] = useState<DocumentDetail | null>(() => getDocumentDetail(documentId));
   const [activeIndex, setActiveIndex] = useState(0);
   const [addingPages, setAddingPages] = useState(false);
-  const [previewBox, setPreviewBox] = useState({ width: 280, height: 390 });
+
+  const [canvasBox, setCanvasBox] = useState({ width: 300, height: 420 });
+  const [pageAspect, setPageAspect] = useState(0.707); // width / height (A4 default)
   const [selectedSigId, setSelectedSigId] = useState<string | null>(null);
 
   const [renameOpen, setRenameOpen] = useState(false);
@@ -210,6 +238,11 @@ export function DocumentDetailScreen({
   const [ocrOpen, setOcrOpen] = useState(false);
   const [signOpen, setSignOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [cropMode, setCropMode] = useState<
+    { type: 'add'; uris: string[] } | { type: 'replace'; pageId: string; uri: string } | null
+  >(null);
+
+  const filmstripRef = useRef<React.ComponentRef<typeof ScrollView>>(null);
 
   const reloadDoc = () => {
     const fresh = getDocumentDetail(documentId);
@@ -218,6 +251,7 @@ export function DocumentDetailScreen({
       setActiveIndex(Math.max(0, fresh.pages.length - 1));
     }
     onDataChanged();
+    return fresh;
   };
 
   useEffect(() => {
@@ -227,6 +261,36 @@ export function DocumentDetailScreen({
   useEffect(() => {
     setSelectedSigId(null);
   }, [activeIndex]);
+
+  const currentPage = doc?.pages[activeIndex] ?? null;
+
+  useEffect(() => {
+    if (!currentPage?.imageUri) return;
+    let active = true;
+    Image.getSize(
+      currentPage.imageUri,
+      (w, h) => {
+        if (active && w > 0 && h > 0) {
+          setPageAspect(w / h);
+        }
+      },
+      () => {}
+    );
+    return () => {
+      active = false;
+    };
+  }, [currentPage?.imageUri]);
+
+  // Dimensiones exactas de la hoja en pantalla para que coincida 1:1 con el PDF
+  const sheetSize = useMemo(() => {
+    const availW = Math.max(120, Math.min(380, canvasBox.width));
+    const availH = Math.max(160, canvasBox.height);
+    const boxRatio = availW / availH;
+    if (pageAspect > boxRatio) {
+      return { width: availW, height: availW / Math.max(0.15, pageAspect) };
+    }
+    return { width: availH * pageAspect, height: availH };
+  }, [canvasBox.width, canvasBox.height, pageAspect]);
 
   if (!doc) {
     return (
@@ -246,7 +310,6 @@ export function DocumentDetailScreen({
     );
   }
 
-  const currentPage = doc.pages[activeIndex] ?? null;
   const pageHasOcr = Boolean(currentPage?.ocrText.trim());
   const pageHasSignatures = (currentPage?.signatures.length ?? 0) > 0;
 
@@ -279,7 +342,8 @@ export function DocumentDetailScreen({
               onBack();
             },
           },
-        ]
+        ],
+        { cancelable: true }
       );
       return;
     }
@@ -297,58 +361,95 @@ export function DocumentDetailScreen({
             reloadDoc();
           },
         },
-      ]
+      ],
+      { cancelable: true }
     );
   };
 
+  const appendPagesAndSelect = (uris: string[]) => {
+    if (uris.length === 0) return;
+    const prevCount = doc.pages.length;
+    addPagesToDocument(doc.id, uris);
+    const fresh = reloadDoc();
+    const targetIdx = fresh ? Math.min(prevCount, fresh.pages.length - 1) : prevCount;
+    setActiveIndex(Math.max(0, targetIdx));
+    setTimeout(() => {
+      filmstripRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+  };
+
+  const launchCameraFallback = async () => {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert(
+        'Permiso de cámara requerido',
+        'Activa el permiso de cámara para Scanly en los ajustes de tu teléfono.'
+      );
+      return;
+    }
+    const camRes = await ImagePicker.launchCameraAsync({
+      mediaTypes: ['images'],
+      quality: 0.95,
+    });
+    if (!camRes.canceled && camRes.assets.length > 0) {
+      setCropMode({ type: 'add', uris: camRes.assets.map((a) => a.uri) });
+    }
+  };
+
   const handleAddPagesPrompt = () => {
-    Alert.alert('Añadir páginas', '¿Cómo quieres agregar nuevas páginas?', [
-      {
-        text: 'Escanear con cámara',
-        onPress: async () => {
-          try {
-            setAddingPages(true);
-            const res = await scanDocument({ pageLimit: 20, galleryImportAllowed: true });
-            if (!res.cancelled && res.pageUris.length > 0) {
-              addPagesToDocument(doc.id, res.pageUris);
-              reloadDoc();
-              setActiveIndex(doc.pages.length);
+    Alert.alert(
+      'Añadir páginas',
+      '¿Cómo quieres agregar nuevas páginas?',
+      [
+        {
+          text: 'Escanear con cámara',
+          onPress: async () => {
+            try {
+              setAddingPages(true);
+              const res = await scanDocument({ pageLimit: 20, galleryImportAllowed: true });
+              if (!res.cancelled && res.pageUris.length > 0) {
+                appendPagesAndSelect(res.pageUris);
+              }
+            } catch {
+              try {
+                await launchCameraFallback();
+              } catch (fallbackErr) {
+                Alert.alert(
+                  'Error al abrir la cámara',
+                  fallbackErr instanceof Error
+                    ? fallbackErr.message
+                    : 'No se pudieron escanear nuevas páginas.'
+                );
+              }
+            } finally {
+              setAddingPages(false);
             }
-          } catch (err) {
-            Alert.alert(
-              'Error al escanear',
-              err instanceof Error ? err.message : 'No se pudieron escanear nuevas páginas.'
-            );
-          } finally {
-            setAddingPages(false);
-          }
+          },
         },
-      },
-      {
-        text: 'Importar de galería',
-        onPress: async () => {
-          try {
-            const res = await ImagePicker.launchImageLibraryAsync({
-              mediaTypes: ['images'],
-              allowsMultipleSelection: true,
-              quality: 0.92,
-            });
-            if (!res.canceled && res.assets.length > 0) {
-              const uris = res.assets.map((a) => copyImageToPermanentStorage(a.uri));
-              addPagesToDocument(doc.id, uris);
-              reloadDoc();
-              setActiveIndex(doc.pages.length);
+        {
+          text: 'Importar de galería',
+          onPress: async () => {
+            try {
+              const res = await ImagePicker.launchImageLibraryAsync({
+                mediaTypes: ['images'],
+                allowsMultipleSelection: true,
+                quality: 0.95,
+              });
+              if (!res.canceled && res.assets.length > 0) {
+                setCropMode({ type: 'add', uris: res.assets.map((a) => a.uri) });
+              }
+            } catch (err) {
+              Alert.alert(
+                'Error al importar',
+                err instanceof Error ? err.message : 'No se pudieron importar las fotos.'
+              );
             }
-          } catch (err) {
-            Alert.alert(
-              'Error al importar',
-              err instanceof Error ? err.message : 'No se pudieron importar las fotos.'
-            );
-          }
+          },
         },
-      },
-      { text: 'Cancelar', style: 'cancel' },
-    ]);
+        { text: 'Cancelar', style: 'cancel' },
+      ],
+      { cancelable: true }
+    );
   };
 
   return (
@@ -406,45 +507,55 @@ export function DocumentDetailScreen({
         {currentPage ? (
           <>
             <View
-              style={styles.pageSheet}
+              style={styles.canvasMeasureWrap}
               onLayout={(e) => {
                 const { width, height } = e.nativeEvent.layout;
                 if (width > 0 && height > 0) {
-                  setPreviewBox({ width, height });
+                  setCanvasBox({ width, height });
                 }
               }}
             >
-              <Image
-                source={{ uri: currentPage.imageUri }}
-                style={[StyleSheet.absoluteFill, { borderRadius: 6 }]}
-                resizeMode="contain"
-              />
-
-              {currentPage.signatures.map((sig) => (
-                <InteractiveSignatureOverlay
-                  key={sig.id}
-                  sig={sig}
-                  selected={selectedSigId === sig.id}
-                  boxWidth={previewBox.width}
-                  boxHeight={previewBox.height}
-                  onSelect={() => setSelectedSigId(sig.id)}
-                  onDelete={() => {
-                    deletePageSignature(doc.id, sig.id);
-                    setSelectedSigId(null);
-                    reloadDoc();
-                  }}
-                  onCommit={(xRatio, yRatio, widthRatio) => {
-                    updatePageSignature({
-                      documentId: doc.id,
-                      placementId: sig.id,
-                      xRatio,
-                      yRatio,
-                      widthRatio,
-                    });
-                    reloadDoc();
-                  }}
+              <View
+                style={[
+                  styles.pageSheet,
+                  {
+                    width: sheetSize.width,
+                    height: sheetSize.height,
+                  },
+                ]}
+              >
+                <Image
+                  source={{ uri: currentPage.imageUri }}
+                  style={[StyleSheet.absoluteFill, { borderRadius: 6 }]}
+                  resizeMode="stretch"
                 />
-              ))}
+
+                {currentPage.signatures.map((sig) => (
+                  <InteractiveSignatureOverlay
+                    key={sig.id}
+                    sig={sig}
+                    selected={selectedSigId === sig.id}
+                    boxWidth={sheetSize.width}
+                    boxHeight={sheetSize.height}
+                    onSelect={() => setSelectedSigId(sig.id)}
+                    onDelete={() => {
+                      deletePageSignature(doc.id, sig.id);
+                      setSelectedSigId(null);
+                      reloadDoc();
+                    }}
+                    onCommit={(xRatio, yRatio, widthRatio) => {
+                      updatePageSignature({
+                        documentId: doc.id,
+                        placementId: sig.id,
+                        xRatio,
+                        yRatio,
+                        widthRatio,
+                      });
+                      reloadDoc();
+                    }}
+                  />
+                ))}
+              </View>
             </View>
 
             {/* Caption & Subtle Page Reorder Controls */}
@@ -502,6 +613,7 @@ export function DocumentDetailScreen({
       {/* Filmstrip (Page Thumbnails) */}
       <View style={styles.filmstripWrap}>
         <ScrollView
+          ref={filmstripRef}
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.filmstripContent}
@@ -548,22 +660,39 @@ export function DocumentDetailScreen({
         </ScrollView>
       </View>
 
-      {/* Bottom 4-Action Toolbar */}
-      <View style={[styles.toolbar, { paddingBottom: Math.max(12, insets.bottom) }]}>
+      {/* Bottom 5-Action Toolbar */}
+      <View style={[styles.toolbar, { paddingBottom: Math.max(14, safeBottom + 6) }]}>
         <TouchableOpacity
           style={styles.toolItem}
           onPress={handleAddPagesPrompt}
           disabled={addingPages}
         >
-          <Ionicons name="add" size={23} color={COLORS.navy} />
+          <Ionicons name="add" size={22} color={COLORS.navy} />
           <Text style={styles.toolLabel}>Añadir</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.toolItem}
+          onPress={() => {
+            if (currentPage) {
+              setCropMode({
+                type: 'replace',
+                pageId: currentPage.id,
+                uri: currentPage.imageUri,
+              });
+            }
+          }}
+          disabled={!currentPage}
+        >
+          <Ionicons name="crop-outline" size={21} color={COLORS.navy} />
+          <Text style={styles.toolLabel}>Recortar</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.toolItem} onPress={() => setOcrOpen(true)}>
           <View style={styles.toolIconWrap}>
             <Ionicons
               name="scan-outline"
-              size={22}
+              size={21}
               color={pageHasOcr ? COLORS.primary : COLORS.navy}
             />
             {pageHasOcr && <View style={styles.ocrReadyDot} />}
@@ -574,7 +703,7 @@ export function DocumentDetailScreen({
         <TouchableOpacity style={styles.toolItem} onPress={() => setSignOpen(true)}>
           <Ionicons
             name="pencil-outline"
-            size={21}
+            size={20}
             color={pageHasSignatures ? COLORS.primary : COLORS.navy}
           />
           <Text style={[styles.toolLabel, pageHasSignatures && { color: COLORS.primary }]}>
@@ -583,10 +712,37 @@ export function DocumentDetailScreen({
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.toolItem} onPress={handleDeleteCurrentPage}>
-          <Ionicons name="trash-outline" size={21} color={COLORS.navy} />
+          <Ionicons name="trash-outline" size={20} color={COLORS.navy} />
           <Text style={styles.toolLabel}>Eliminar</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Sheet Cropper Modal (for added gallery images OR re-cropping current page) */}
+      <CropDocumentModal
+        visible={cropMode !== null}
+        imageUris={
+          cropMode?.type === 'add'
+            ? cropMode.uris
+            : cropMode?.type === 'replace'
+            ? [cropMode.uri]
+            : []
+        }
+        title={cropMode?.type === 'replace' ? 'Ajustar recorte' : 'Recortar hoja'}
+        initialFilter={cropMode?.type === 'replace' ? 'original' : 'document'}
+        autoDetect={cropMode?.type !== 'replace'}
+        onCancel={() => setCropMode(null)}
+        onComplete={(croppedUris) => {
+          const mode = cropMode;
+          setCropMode(null);
+          if (!mode || croppedUris.length === 0) return;
+          if (mode.type === 'add') {
+            appendPagesAndSelect(croppedUris);
+          } else {
+            replacePageImage(doc.id, mode.pageId, croppedUris[0]);
+            reloadDoc();
+          }
+        }}
+      />
 
       {/* Modals */}
       <RenameModal
@@ -724,16 +880,19 @@ const styles = StyleSheet.create({
   canvasArea: {
     flex: 1,
     backgroundColor: COLORS.canvas,
-    paddingHorizontal: 22,
-    paddingTop: 18,
-    paddingBottom: 12,
+    paddingHorizontal: 20,
+    paddingTop: 14,
+    paddingBottom: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  canvasMeasureWrap: {
+    flex: 1,
+    width: '100%',
     alignItems: 'center',
     justifyContent: 'center',
   },
   pageSheet: {
-    width: '100%',
-    flex: 1,
-    maxWidth: 360,
     backgroundColor: '#FFFFFF',
     borderRadius: 6,
     overflow: 'visible',
@@ -754,7 +913,6 @@ const styles = StyleSheet.create({
   sigDragArea: {
     width: '100%',
     height: '100%',
-    padding: 3,
   },
   sigImage: {
     width: '100%',
@@ -790,7 +948,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    marginTop: 12,
+    marginTop: 10,
   },
   pageCaptionText: {
     fontSize: 12,
@@ -812,7 +970,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bg,
     borderTopWidth: 1,
     borderTopColor: COLORS.border,
-    paddingVertical: 11,
+    paddingVertical: 10,
   },
   filmstripContent: {
     paddingHorizontal: 16,
@@ -820,8 +978,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   thumbCard: {
-    width: 54,
-    height: 70,
+    width: 52,
+    height: 68,
     borderRadius: 8,
     overflow: 'hidden',
     borderWidth: 1.5,
@@ -850,8 +1008,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   addThumbCard: {
-    width: 54,
-    height: 70,
+    width: 52,
+    height: 68,
     borderRadius: 8,
     borderWidth: 1.5,
     borderStyle: 'dashed',
@@ -865,7 +1023,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
     alignItems: 'center',
     paddingTop: 10,
-    paddingHorizontal: 10,
+    paddingHorizontal: 6,
     backgroundColor: COLORS.surface,
     borderTopWidth: 1,
     borderTopColor: COLORS.border,
@@ -874,7 +1032,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 4,
-    minWidth: 68,
+    minWidth: 58,
     paddingVertical: 2,
   },
   toolIconWrap: {

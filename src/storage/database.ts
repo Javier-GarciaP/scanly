@@ -16,9 +16,17 @@ function generateId(prefix: string): string {
   return `${prefix}_${Date.now()}_${rand}`;
 }
 
+function normalizeSearchText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
 export function getDb(): SQLite.SQLiteDatabase {
   if (!dbInstance) {
     dbInstance = SQLite.openDatabaseSync('scanly.db');
+    dbInstance.execSync('PRAGMA foreign_keys = ON;');
   }
   return dbInstance;
 }
@@ -41,26 +49,35 @@ export function ensureAppDirs(): {
 
 export function copyImageToPermanentStorage(sourceUri: string): string {
   const { pagesDir } = ensureAppDirs();
-  const destFile = new File(pagesDir, `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`);
+  const extMatch = sourceUri.split('?')[0].match(/\.(jpe?g|png|webp)$/i);
+  const ext = extMatch ? extMatch[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
+  const destFile = new File(
+    pagesDir,
+    `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`
+  );
   const srcFile = new File(sourceUri);
-  srcFile.copy(destFile);
+  srcFile.copySync(destFile);
   return destFile.uri;
 }
 
 export function getPdfOutputPath(docId: string, title: string): string {
   const { pdfsDir } = ensureAppDirs();
-  const safe = title
-    .trim()
-    .replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ._\- ]/g, '_')
-    .replace(/\s+/g, '_')
-    .slice(0, 48) || 'documento';
+  const safe =
+    title
+      .trim()
+      .replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ._\- ]/g, '_')
+      .replace(/\s+/g, '_')
+      .slice(0, 48) || 'documento';
   const file = new File(pdfsDir, `${safe}_${docId.slice(-6)}.pdf`);
   return file.uri;
 }
 
 export function getSignatureOutputPath(): string {
   const { signaturesDir } = ensureAppDirs();
-  const file = new File(signaturesDir, `sig_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`);
+  const file = new File(
+    signaturesDir,
+    `sig_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`
+  );
   return file.uri;
 }
 
@@ -73,6 +90,17 @@ function safeDeleteFile(uri: string | null | undefined): void {
     }
   } catch {
     // Ignore file cleanup errors
+  }
+}
+
+function invalidateCachedPdf(db: SQLite.SQLiteDatabase, documentId: string): void {
+  const row = db.getFirstSync<{ pdf_uri: string | null }>(
+    'SELECT pdf_uri FROM documents WHERE id = ?',
+    [documentId]
+  );
+  if (row?.pdf_uri) {
+    safeDeleteFile(row.pdf_uri);
+    db.runSync('UPDATE documents SET pdf_uri = NULL WHERE id = ?', [documentId]);
   }
 }
 
@@ -127,25 +155,19 @@ export function initDatabase(): void {
       x_ratio REAL NOT NULL,
       y_ratio REAL NOT NULL,
       width_ratio REAL NOT NULL,
-      FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
+      FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,
+      FOREIGN KEY (signature_id) REFERENCES signatures(id) ON DELETE CASCADE
     );
   `);
 
-  const countRow = db.getFirstSync<{ count: number }>('SELECT COUNT(*) as count FROM folders');
-  if ((countRow?.count ?? 0) === 0) {
-    const now = Date.now();
-    const defaults = [
-      { id: 'folder_personal', name: 'Personal', color: '#2563EB' },
-      { id: 'folder_trabajo', name: 'Trabajo', color: '#059669' },
-      { id: 'folder_facturas', name: 'Facturas', color: '#D97706' },
-    ];
-    for (const f of defaults) {
-      db.runSync(
-        'INSERT OR IGNORE INTO folders (id, name, color, created_at) VALUES (?, ?, ?, ?)',
-        [f.id, f.name, f.color, now]
-      );
-    }
-  }
+  // Older versions seeded three folders. Remove them; documents fall back to "Sin carpeta".
+  // Renamed folders keep their id, so only untouched defaults are removed.
+  db.runSync(`
+    DELETE FROM folders
+    WHERE (id = 'folder_personal' AND name = 'Personal')
+       OR (id = 'folder_trabajo' AND name = 'Trabajo')
+       OR (id = 'folder_facturas' AND name = 'Facturas')
+  `);
 }
 
 export function getFolders(): Folder[] {
@@ -194,8 +216,10 @@ export function updateFolder(id: string, name: string, color: string): void {
 
 export function deleteFolder(id: string): void {
   const db = getDb();
-  db.runSync('UPDATE documents SET folder_id = NULL WHERE folder_id = ?', [id]);
-  db.runSync('DELETE FROM folders WHERE id = ?', [id]);
+  db.withTransactionSync(() => {
+    db.runSync('UPDATE documents SET folder_id = NULL WHERE folder_id = ?', [id]);
+    db.runSync('DELETE FROM folders WHERE id = ?', [id]);
+  });
 }
 
 export function getDocuments(options?: {
@@ -219,13 +243,6 @@ export function getDocuments(options?: {
       conditions.push('d.folder_id = ?');
       params.push(options.folderFilter);
     }
-  }
-
-  const query = options?.searchQuery?.trim();
-  if (query) {
-    conditions.push('(LOWER(d.title) LIKE ? OR LOWER(d.ocr_text) LIKE ?)');
-    const pattern = `%${query.toLowerCase()}%`;
-    params.push(pattern, pattern);
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -268,7 +285,7 @@ export function getDocuments(options?: {
     params
   );
 
-  return rows.map((r) => ({
+  const mapped: DocumentRecord[] = rows.map((r) => ({
     id: r.id,
     title: r.title,
     folderId: r.folder_id,
@@ -283,6 +300,19 @@ export function getDocuments(options?: {
     folderName: r.folder_name,
     folderColor: r.folder_color,
   }));
+
+  const normalizedQuery = options?.searchQuery?.trim()
+    ? normalizeSearchText(options.searchQuery.trim())
+    : '';
+  if (!normalizedQuery) {
+    return mapped;
+  }
+
+  return mapped.filter(
+    (doc) =>
+      normalizeSearchText(doc.title).includes(normalizedQuery) ||
+      normalizeSearchText(doc.ocrText).includes(normalizedQuery)
+  );
 }
 
 export function getDocumentDetail(documentId: string): DocumentDetail | null {
@@ -400,19 +430,21 @@ export function createDocument(
   const now = Date.now();
   const cleanTitle = title.trim() || formatDefaultDocTitle();
 
-  db.runSync(
-    `INSERT INTO documents (id, title, folder_id, pdf_uri, is_password_protected, ocr_text, created_at, updated_at)
-     VALUES (?, ?, ?, NULL, 0, '', ?, ?)`,
-    [docId, cleanTitle, folderId, now, now]
-  );
-
-  pageUris.forEach((uri, idx) => {
-    const pageId = generateId('pg');
+  db.withTransactionSync(() => {
     db.runSync(
-      `INSERT INTO pages (id, document_id, image_uri, page_order, ocr_text, created_at)
-       VALUES (?, ?, ?, ?, '', ?)`,
-      [pageId, docId, uri, idx, now]
+      `INSERT INTO documents (id, title, folder_id, pdf_uri, is_password_protected, ocr_text, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 0, '', ?, ?)`,
+      [docId, cleanTitle, folderId, now, now]
     );
+
+    pageUris.forEach((uri, idx) => {
+      const pageId = generateId('pg');
+      db.runSync(
+        `INSERT INTO pages (id, document_id, image_uri, page_order, ocr_text, created_at)
+         VALUES (?, ?, ?, ?, '', ?)`,
+        [pageId, docId, uri, idx, now]
+      );
+    });
   });
 
   return docId;
@@ -442,6 +474,13 @@ export function updateDocumentPdf(
   isPasswordProtected: boolean
 ): void {
   const db = getDb();
+  const prev = db.getFirstSync<{ pdf_uri: string | null }>(
+    'SELECT pdf_uri FROM documents WHERE id = ?',
+    [documentId]
+  );
+  if (prev?.pdf_uri && prev.pdf_uri !== pdfUri) {
+    safeDeleteFile(prev.pdf_uri);
+  }
   db.runSync(
     'UPDATE documents SET pdf_uri = ?, is_password_protected = ?, updated_at = ? WHERE id = ?',
     [pdfUri, isPasswordProtected ? 1 : 0, Date.now(), documentId]
@@ -450,22 +489,47 @@ export function updateDocumentPdf(
 
 export function addPagesToDocument(documentId: string, pageUris: string[]): void {
   const db = getDb();
-  const maxOrderRow = db.getFirstSync<{ max_order: number | null }>(
-    'SELECT MAX(page_order) as max_order FROM pages WHERE document_id = ?',
-    [documentId]
-  );
-  let nextOrder = (maxOrderRow?.max_order ?? -1) + 1;
   const now = Date.now();
-
-  for (const uri of pageUris) {
-    db.runSync(
-      `INSERT INTO pages (id, document_id, image_uri, page_order, ocr_text, created_at)
-       VALUES (?, ?, ?, ?, '', ?)`,
-      [generateId('pg'), documentId, uri, nextOrder++, now]
+  db.withTransactionSync(() => {
+    const maxOrderRow = db.getFirstSync<{ max_order: number | null }>(
+      'SELECT MAX(page_order) as max_order FROM pages WHERE document_id = ?',
+      [documentId]
     );
-  }
+    let nextOrder = (maxOrderRow?.max_order ?? -1) + 1;
 
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [now, documentId]);
+    for (const uri of pageUris) {
+      db.runSync(
+        `INSERT INTO pages (id, document_id, image_uri, page_order, ocr_text, created_at)
+         VALUES (?, ?, ?, ?, '', ?)`,
+        [generateId('pg'), documentId, uri, nextOrder++, now]
+      );
+    }
+
+    invalidateCachedPdf(db, documentId);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [now, documentId]);
+  });
+}
+
+export function replacePageImage(documentId: string, pageId: string, newImageUri: string): void {
+  const db = getDb();
+  const oldRow = db.getFirstSync<{ image_uri: string }>(
+    'SELECT image_uri FROM pages WHERE id = ?',
+    [pageId]
+  );
+
+  db.withTransactionSync(() => {
+    db.runSync('UPDATE pages SET image_uri = ? WHERE id = ? AND document_id = ?', [
+      newImageUri,
+      pageId,
+      documentId,
+    ]);
+    invalidateCachedPdf(db, documentId);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  });
+
+  if (oldRow?.image_uri && oldRow.image_uri !== newImageUri) {
+    safeDeleteFile(oldRow.image_uri);
+  }
 }
 
 export function deletePage(documentId: string, pageId: string): void {
@@ -474,39 +538,49 @@ export function deletePage(documentId: string, pageId: string): void {
     'SELECT image_uri FROM pages WHERE id = ?',
     [pageId]
   );
-  db.runSync('DELETE FROM pages WHERE id = ?', [pageId]);
-  safeDeleteFile(page?.image_uri);
 
-  const remaining = db.getAllSync<{ id: string }>(
-    'SELECT id FROM pages WHERE document_id = ? ORDER BY page_order ASC',
-    [documentId]
-  );
-  remaining.forEach((p, idx) => {
-    db.runSync('UPDATE pages SET page_order = ? WHERE id = ?', [idx, p.id]);
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM pages WHERE id = ?', [pageId]);
+
+    const remaining = db.getAllSync<{ id: string }>(
+      'SELECT id FROM pages WHERE document_id = ? ORDER BY page_order ASC',
+      [documentId]
+    );
+    remaining.forEach((p, idx) => {
+      db.runSync('UPDATE pages SET page_order = ? WHERE id = ?', [idx, p.id]);
+    });
+
+    invalidateCachedPdf(db, documentId);
+    refreshDocumentOcrText(documentId);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
   });
 
-  refreshDocumentOcrText(documentId);
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  safeDeleteFile(page?.image_uri);
 }
 
 export function reorderPages(documentId: string, orderedPageIds: string[]): void {
   const db = getDb();
-  orderedPageIds.forEach((id, idx) => {
-    db.runSync('UPDATE pages SET page_order = ? WHERE id = ? AND document_id = ?', [
-      idx,
-      id,
-      documentId,
-    ]);
+  db.withTransactionSync(() => {
+    orderedPageIds.forEach((id, idx) => {
+      db.runSync('UPDATE pages SET page_order = ? WHERE id = ? AND document_id = ?', [
+        idx,
+        id,
+        documentId,
+      ]);
+    });
+    invalidateCachedPdf(db, documentId);
+    refreshDocumentOcrText(documentId);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
   });
-  refreshDocumentOcrText(documentId);
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
 }
 
 export function updatePageOcr(documentId: string, pageId: string, ocrText: string): void {
   const db = getDb();
-  db.runSync('UPDATE pages SET ocr_text = ? WHERE id = ?', [ocrText, pageId]);
-  refreshDocumentOcrText(documentId);
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  db.withTransactionSync(() => {
+    db.runSync('UPDATE pages SET ocr_text = ? WHERE id = ?', [ocrText, pageId]);
+    refreshDocumentOcrText(documentId);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  });
 }
 
 function refreshDocumentOcrText(documentId: string): void {
@@ -533,7 +607,9 @@ export function deleteDocument(documentId: string): void {
     [documentId]
   );
 
-  db.runSync('DELETE FROM documents WHERE id = ?', [documentId]);
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM documents WHERE id = ?', [documentId]);
+  });
 
   safeDeleteFile(doc?.pdf_uri);
   pages.forEach((p) => safeDeleteFile(p.image_uri));
@@ -563,10 +639,12 @@ export function saveSignatureRecord(name: string, imageUri: string): SignatureRe
   const id = generateId('sig');
   const now = Date.now();
   const cleanName = name.trim() || `Firma ${new Date().toLocaleDateString()}`;
-  db.runSync(
-    'INSERT INTO signatures (id, name, image_uri, created_at) VALUES (?, ?, ?, ?)',
-    [id, cleanName, imageUri, now]
-  );
+  db.runSync('INSERT INTO signatures (id, name, image_uri, created_at) VALUES (?, ?, ?, ?)', [
+    id,
+    cleanName,
+    imageUri,
+    now,
+  ]);
   return { id, name: cleanName, imageUri, createdAt: now };
 }
 
@@ -576,8 +654,10 @@ export function deleteSignatureRecord(signatureId: string): void {
     'SELECT image_uri FROM signatures WHERE id = ?',
     [signatureId]
   );
-  db.runSync('DELETE FROM page_signatures WHERE signature_id = ?', [signatureId]);
-  db.runSync('DELETE FROM signatures WHERE id = ?', [signatureId]);
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM page_signatures WHERE signature_id = ?', [signatureId]);
+    db.runSync('DELETE FROM signatures WHERE id = ?', [signatureId]);
+  });
   safeDeleteFile(row?.image_uri);
 }
 
@@ -592,20 +672,22 @@ export function addSignatureToPage(params: {
 }): PageSignaturePlacement {
   const db = getDb();
   const id = generateId('psig');
-  db.runSync(
-    `INSERT INTO page_signatures (id, page_id, signature_id, image_uri, x_ratio, y_ratio, width_ratio)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      params.pageId,
-      params.signatureId,
-      params.imageUri,
-      params.xRatio,
-      params.yRatio,
-      params.widthRatio,
-    ]
-  );
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), params.documentId]);
+  db.withTransactionSync(() => {
+    db.runSync(
+      `INSERT INTO page_signatures (id, page_id, signature_id, image_uri, x_ratio, y_ratio, width_ratio)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        params.pageId,
+        params.signatureId,
+        params.imageUri,
+        params.xRatio,
+        params.yRatio,
+        params.widthRatio,
+      ]
+    );
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), params.documentId]);
+  });
   return {
     id,
     pageId: params.pageId,
@@ -625,21 +707,27 @@ export function updatePageSignature(params: {
   widthRatio: number;
 }): void {
   const db = getDb();
-  db.runSync(
-    'UPDATE page_signatures SET x_ratio = ?, y_ratio = ?, width_ratio = ? WHERE id = ?',
-    [params.xRatio, params.yRatio, params.widthRatio, params.placementId]
-  );
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), params.documentId]);
+  db.withTransactionSync(() => {
+    db.runSync(
+      'UPDATE page_signatures SET x_ratio = ?, y_ratio = ?, width_ratio = ? WHERE id = ?',
+      [params.xRatio, params.yRatio, params.widthRatio, params.placementId]
+    );
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), params.documentId]);
+  });
 }
 
 export function deletePageSignature(documentId: string, placementId: string): void {
   const db = getDb();
-  db.runSync('DELETE FROM page_signatures WHERE id = ?', [placementId]);
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM page_signatures WHERE id = ?', [placementId]);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  });
 }
 
 export function clearPageSignatures(documentId: string, pageId: string): void {
   const db = getDb();
-  db.runSync('DELETE FROM page_signatures WHERE page_id = ?', [pageId]);
-  db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM page_signatures WHERE page_id = ?', [pageId]);
+    db.runSync('UPDATE documents SET updated_at = ? WHERE id = ?', [Date.now(), documentId]);
+  });
 }

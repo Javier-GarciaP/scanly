@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,7 +13,6 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Clipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
@@ -19,6 +20,7 @@ import { recognizeText } from '../../modules/doc-engine';
 import type { DocumentDetail } from '../types/models';
 import { updatePageOcr } from '../storage/database';
 import { EmptyStateIllustration } from './EmptyStateIllustration';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 interface OcrModalProps {
@@ -36,7 +38,7 @@ export function OcrModal({
   onClose,
   onSaved,
 }: OcrModalProps) {
-  const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [text, setText] = useState('');
   const [blocks, setBlocks] = useState<string[]>([]);
   const [viewTab, setViewTab] = useState<'blocks' | 'full'>('blocks');
@@ -46,7 +48,19 @@ export function OcrModal({
   const [copiedAll, setCopiedAll] = useState(false);
   const [copiedBlockIndex, setCopiedBlockIndex] = useState<number | null>(null);
 
+  const requestIdRef = useRef(0);
+  const copyAllTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyBlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const currentPage = document?.pages[pageIndex] ?? null;
+
+  useEffect(() => {
+    return () => {
+      requestIdRef.current++;
+      if (copyAllTimerRef.current) clearTimeout(copyAllTimerRef.current);
+      if (copyBlockTimerRef.current) clearTimeout(copyBlockTimerRef.current);
+    };
+  }, []);
 
   const derivedBlocks = useMemo(() => {
     if (blocks.length > 0) return blocks;
@@ -60,7 +74,14 @@ export function OcrModal({
   }, [blocks, text]);
 
   useEffect(() => {
-    if (visible && document && currentPage) {
+    if (!visible) {
+      requestIdRef.current++;
+      setLoading(false);
+      setStatusLabel('');
+      return;
+    }
+
+    if (document && currentPage) {
       setCopiedAll(false);
       setCopiedBlockIndex(null);
       setScope('page');
@@ -78,11 +99,13 @@ export function OcrModal({
 
   const runOcrForCurrentPage = async () => {
     if (!document || !currentPage) return;
+    const reqId = ++requestIdRef.current;
     try {
       setLoading(true);
       setScope('page');
       setStatusLabel(`Analizando página ${pageIndex + 1} (offline)...`);
       const res = await recognizeText(currentPage.imageUri);
+      if (requestIdRef.current !== reqId) return;
       const recognized = res.text.trim();
       const extractedBlocks = res.blocks.map((b) => b.text.trim()).filter(Boolean);
       setText(recognized);
@@ -90,27 +113,33 @@ export function OcrModal({
       updatePageOcr(document.id, currentPage.id, recognized);
       onSaved();
     } catch (err) {
+      if (requestIdRef.current !== reqId) return;
       Alert.alert(
         'Error de OCR',
         err instanceof Error ? err.message : 'No se pudo extraer el texto.'
       );
     } finally {
-      setLoading(false);
-      setStatusLabel('');
+      if (requestIdRef.current === reqId) {
+        setLoading(false);
+        setStatusLabel('');
+      }
     }
   };
 
   const runOcrForAllPages = async () => {
     if (!document || document.pages.length === 0) return;
+    const reqId = ++requestIdRef.current;
     try {
       setLoading(true);
       setScope('all');
       const parts: string[] = [];
       const allBlocks: string[] = [];
       for (let i = 0; i < document.pages.length; i++) {
+        if (requestIdRef.current !== reqId) return;
         const p = document.pages[i];
         setStatusLabel(`Analizando página ${i + 1} de ${document.pages.length}...`);
         const res = await recognizeText(p.imageUri);
+        if (requestIdRef.current !== reqId) return;
         const pageText = res.text.trim();
         updatePageOcr(document.id, p.id, pageText);
         if (pageText) {
@@ -122,13 +151,16 @@ export function OcrModal({
       setBlocks(allBlocks);
       onSaved();
     } catch (err) {
+      if (requestIdRef.current !== reqId) return;
       Alert.alert(
         'Error de OCR',
         err instanceof Error ? err.message : 'No se pudo extraer el texto de todas las páginas.'
       );
     } finally {
-      setLoading(false);
-      setStatusLabel('');
+      if (requestIdRef.current === reqId) {
+        setLoading(false);
+        setStatusLabel('');
+      }
     }
   };
 
@@ -137,24 +169,46 @@ export function OcrModal({
     await Clipboard.setStringAsync(text);
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
     setCopiedAll(true);
-    setTimeout(() => setCopiedAll(false), 2000);
+    if (copyAllTimerRef.current) clearTimeout(copyAllTimerRef.current);
+    copyAllTimerRef.current = setTimeout(() => setCopiedAll(false), 2000);
   };
 
   const handleCopyBlock = async (blockText: string, idx: number) => {
     await Clipboard.setStringAsync(blockText);
     Haptics.selectionAsync().catch(() => {});
     setCopiedBlockIndex(idx);
-    setTimeout(() => {
+    if (copyBlockTimerRef.current) clearTimeout(copyBlockTimerRef.current);
+    copyBlockTimerRef.current = setTimeout(() => {
       setCopiedBlockIndex((curr) => (curr === idx ? null : curr));
     }, 1600);
   };
 
   const handleCloseAndSave = () => {
-    if (document && currentPage && scope === 'page') {
-      const cleaned = text.trim();
-      if (cleaned !== currentPage.ocrText.trim()) {
-        updatePageOcr(document.id, currentPage.id, cleaned);
-        onSaved();
+    requestIdRef.current++;
+    if (document && currentPage) {
+      if (scope === 'page') {
+        const cleaned = text.trim();
+        if (cleaned !== currentPage.ocrText.trim()) {
+          updatePageOcr(document.id, currentPage.id, cleaned);
+          onSaved();
+        }
+      } else if (scope === 'all') {
+        // Persistir ediciones manuales por encabezado "--- Página N ---"
+        const regex = /---\s*Página\s+(\d+)\s*---\s*\n?([\s\S]*?)(?=(?:\n\n?---\s*Página\s+\d+\s*---)|$)/g;
+        let match: RegExpExecArray | null;
+        let changed = false;
+        while ((match = regex.exec(text)) !== null) {
+          const idx = Number(match[1]) - 1;
+          const content = match[2].trim();
+          const targetPage = document.pages[idx];
+          if (targetPage && content !== targetPage.ocrText.trim()) {
+            updatePageOcr(document.id, targetPage.id, content);
+            changed = true;
+          }
+        }
+        if (changed) {
+          onSaved();
+        }
       }
     }
     onClose();
@@ -162,161 +216,176 @@ export function OcrModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={handleCloseAndSave}>
-      <Pressable style={styles.backdrop} onPress={handleCloseAndSave}>
-        <Pressable
-          style={[styles.sheet, { paddingBottom: Math.max(20, insets.bottom + 10) }]}
-          onPress={() => {}}
-        >
-          <View style={styles.handle} />
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+        <View style={styles.backdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={handleCloseAndSave} />
+          <View style={[styles.sheet, { paddingBottom: Math.max(20, safeBottom + 10) }]}>
+            <View style={styles.handle} />
 
-          {/* Header */}
-          <View style={styles.header}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.title}>
-                {scope === 'all'
-                  ? `Texto detectado (${document?.pages.length ?? 0} págs)`
-                  : `Texto detectado (Pág. ${pageIndex + 1})`}
-              </Text>
+            {/* Header */}
+            <View style={styles.header}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.title}>
+                  {scope === 'all'
+                    ? `Texto detectado (${document?.pages.length ?? 0} págs)`
+                    : `Texto detectado (Pág. ${pageIndex + 1})`}
+                </Text>
+              </View>
+
+              <TouchableOpacity
+                style={styles.closeCircle}
+                onPress={handleCloseAndSave}
+                hitSlop={8}
+              >
+                <Ionicons name="close" size={18} color={COLORS.textSecondary} />
+              </TouchableOpacity>
             </View>
 
-            <TouchableOpacity style={styles.closeCircle} onPress={handleCloseAndSave} hitSlop={8}>
-              <Ionicons name="close" size={18} color={COLORS.textSecondary} />
-            </TouchableOpacity>
-          </View>
-
-          {/* Segmented Control */}
-          <View style={styles.segmentTrack}>
-            <TouchableOpacity
-              style={[styles.segmentBtn, viewTab === 'full' && styles.segmentBtnActive]}
-              onPress={() => {
-                Haptics.selectionAsync().catch(() => {});
-                setViewTab('full');
-              }}
-            >
-              <Text
-                style={[styles.segmentText, viewTab === 'full' && styles.segmentTextActive]}
-              >
-                Texto completo
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.segmentBtn, viewTab === 'blocks' && styles.segmentBtnActive]}
-              onPress={() => {
-                Haptics.selectionAsync().catch(() => {});
-                setViewTab('blocks');
-              }}
-            >
-              <Text
-                style={[styles.segmentText, viewTab === 'blocks' && styles.segmentTextActive]}
-              >
-                Por bloques ({derivedBlocks.length})
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Multi-page quick pill */}
-          {(document?.pages.length ?? 0) > 1 && !loading && (
-            <TouchableOpacity style={styles.allPagesBanner} onPress={runOcrForAllPages}>
-              <Ionicons name="documents-outline" size={14} color={COLORS.primary} />
-              <Text style={styles.allPagesBannerText}>
-                Extraer texto de las {document?.pages.length} páginas
-              </Text>
-            </TouchableOpacity>
-          )}
-
-          {/* Body */}
-          <View style={styles.body}>
-            {loading ? (
-              <View style={styles.loadingBox}>
-                <ActivityIndicator size="large" color={COLORS.primary} />
-                <Text style={styles.loadingText}>{statusLabel || 'Reconociendo texto...'}</Text>
-                <Text style={styles.loadingSub}>Procesamiento 100% local en el dispositivo</Text>
-              </View>
-            ) : viewTab === 'blocks' ? (
-              derivedBlocks.length > 0 ? (
-                <ScrollView
-                  showsVerticalScrollIndicator={false}
-                  contentContainerStyle={styles.blocksList}
-                >
-                  {derivedBlocks.map((block, idx) => {
-                    const isCopied = copiedBlockIndex === idx;
-                    return (
-                      <View key={idx} style={styles.blockCard}>
-                        <Text selectable style={styles.blockText}>
-                          {block}
-                        </Text>
-                        <TouchableOpacity
-                          style={styles.blockCopyBtn}
-                          onPress={() => handleCopyBlock(block, idx)}
-                          hitSlop={10}
-                        >
-                          <Ionicons
-                            name={isCopied ? 'checkmark' : 'copy-outline'}
-                            size={16}
-                            color={isCopied ? COLORS.success : COLORS.textSecondary}
-                          />
-                        </TouchableOpacity>
-                      </View>
-                    );
-                  })}
-                </ScrollView>
-              ) : (
-                <View style={styles.emptyOcrBox}>
-                  <EmptyStateIllustration variant="ocr" size={96} />
-                  <Text style={styles.emptyOcrTitle}>Sin texto detectado</Text>
-                  <Text style={styles.emptyOcrSub}>Toca Re-analizar para intentar</Text>
-                </View>
-              )
-            ) : (
-              <TextInput
-                value={text}
-                onChangeText={(val) => {
-                  setText(val);
-                  setBlocks([]);
+            {/* Segmented Control */}
+            <View style={styles.segmentTrack}>
+              <TouchableOpacity
+                style={[styles.segmentBtn, viewTab === 'full' && styles.segmentBtnActive]}
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => {});
+                  setViewTab('full');
                 }}
-                multiline
-                textAlignVertical="top"
-                placeholder="No se detectó texto en esta página. Toca Re-analizar o escribe aquí..."
-                placeholderTextColor={COLORS.textMuted}
-                style={styles.fullTextArea}
-              />
+              >
+                <Text
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  style={[styles.segmentText, viewTab === 'full' && styles.segmentTextActive]}
+                >
+                  Texto completo
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.segmentBtn, viewTab === 'blocks' && styles.segmentBtnActive]}
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => {});
+                  setViewTab('blocks');
+                }}
+              >
+                <Text
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  style={[styles.segmentText, viewTab === 'blocks' && styles.segmentTextActive]}
+                >
+                  Por bloques ({derivedBlocks.length})
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Multi-page quick pill */}
+            {(document?.pages.length ?? 0) > 1 && !loading && (
+              <TouchableOpacity style={styles.allPagesBanner} onPress={runOcrForAllPages}>
+                <Ionicons name="documents-outline" size={14} color={COLORS.primary} />
+                <Text numberOfLines={2} style={styles.allPagesBannerText}>
+                  Extraer texto de las {document?.pages.length} páginas
+                </Text>
+              </TouchableOpacity>
             )}
-          </View>
 
-          {/* Footer Actions */}
-          <View style={styles.footerRow}>
-            <TouchableOpacity
-              style={[styles.outlineBtn, loading && { opacity: 0.5 }]}
-              onPress={runOcrForCurrentPage}
-              disabled={loading}
-              activeOpacity={0.85}
-            >
-              <Text style={styles.outlineBtnText}>Re-analizar</Text>
-            </TouchableOpacity>
+            {/* Body */}
+            <View style={styles.body}>
+              {loading ? (
+                <View style={styles.loadingBox}>
+                  <ActivityIndicator size="large" color={COLORS.primary} />
+                  <Text style={styles.loadingText}>{statusLabel || 'Reconociendo texto...'}</Text>
+                  <Text style={styles.loadingSub}>Procesamiento 100% local en el dispositivo</Text>
+                </View>
+              ) : viewTab === 'blocks' ? (
+                derivedBlocks.length > 0 ? (
+                  <ScrollView
+                    style={styles.blocksScroll}
+                    nestedScrollEnabled
+                    showsVerticalScrollIndicator={false}
+                    contentContainerStyle={styles.blocksList}
+                  >
+                    {derivedBlocks.map((block, idx) => {
+                      const isCopied = copiedBlockIndex === idx;
+                      return (
+                        <View key={idx} style={styles.blockCard}>
+                          <Text selectable style={styles.blockText}>
+                            {block}
+                          </Text>
+                          <TouchableOpacity
+                            style={styles.blockCopyBtn}
+                            onPress={() => handleCopyBlock(block, idx)}
+                            hitSlop={10}
+                          >
+                            <Ionicons
+                              name={isCopied ? 'checkmark' : 'copy-outline'}
+                              size={16}
+                              color={isCopied ? COLORS.success : COLORS.textSecondary}
+                            />
+                          </TouchableOpacity>
+                        </View>
+                      );
+                    })}
+                  </ScrollView>
+                ) : (
+                  <View style={styles.emptyOcrBox}>
+                    <EmptyStateIllustration variant="ocr" size={96} />
+                    <Text style={styles.emptyOcrTitle}>Sin texto detectado</Text>
+                    <Text style={styles.emptyOcrSub}>Toca Re-analizar para intentar</Text>
+                  </View>
+                )
+              ) : (
+                <TextInput
+                  value={text}
+                  onChangeText={(val) => {
+                    setText(val);
+                    setBlocks([]);
+                  }}
+                  multiline
+                  textAlignVertical="top"
+                  placeholder="No se detectó texto en esta página. Toca Re-analizar o escribe aquí..."
+                  placeholderTextColor={COLORS.textMuted}
+                  style={styles.fullTextArea}
+                />
+              )}
+            </View>
 
-            <TouchableOpacity
-              style={[
-                styles.navyBtn,
-                copiedAll && { backgroundColor: COLORS.success },
-                (!text.trim() || loading) && { opacity: 0.45 },
-              ]}
-              onPress={handleCopyAll}
-              disabled={!text.trim() || loading}
-              activeOpacity={0.88}
-            >
-              <Ionicons
-                name={copiedAll ? 'checkmark-circle' : 'clipboard-outline'}
-                size={17}
-                color="#FFFFFF"
-              />
-              <Text style={styles.navyBtnText}>
-                {copiedAll ? '¡Copiado!' : 'Copiar todo'}
-              </Text>
-            </TouchableOpacity>
+            {/* Footer Actions */}
+            <View style={styles.footerRow}>
+              <TouchableOpacity
+                style={[styles.outlineBtn, loading && { opacity: 0.5 }]}
+                onPress={runOcrForCurrentPage}
+                disabled={loading}
+                activeOpacity={0.85}
+              >
+                <Text numberOfLines={1} style={styles.outlineBtnText}>
+                  Re-analizar
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.navyBtn,
+                  copiedAll && { backgroundColor: COLORS.success },
+                  (!text.trim() || loading) && { opacity: 0.45 },
+                ]}
+                onPress={handleCopyAll}
+                disabled={!text.trim() || loading}
+                activeOpacity={0.88}
+              >
+                <Ionicons
+                  name={copiedAll ? 'checkmark-circle' : 'clipboard-outline'}
+                  size={17}
+                  color="#FFFFFF"
+                />
+                <Text numberOfLines={1} adjustsFontSizeToFit style={styles.navyBtnText}>
+                  {copiedAll ? '¡Copiado!' : 'Copiar todo'}
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
-        </Pressable>
-      </Pressable>
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -383,6 +452,7 @@ const styles = StyleSheet.create({
     ...SHADOWS.segment,
   },
   segmentText: {
+    flexShrink: 1,
     fontSize: 13,
     fontWeight: '600',
     color: COLORS.textSecondary,
@@ -429,6 +499,9 @@ const styles = StyleSheet.create({
   blocksList: {
     gap: 10,
     paddingBottom: 12,
+  },
+  blocksScroll: {
+    flex: 1,
   },
   blockCard: {
     flexDirection: 'row',

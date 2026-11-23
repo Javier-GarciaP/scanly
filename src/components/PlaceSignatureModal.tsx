@@ -17,6 +17,7 @@ import type { PageRecord, SignatureRecord } from '../types/models';
 import { deleteSignatureRecord, getSignatures } from '../storage/database';
 import { SignaturePadModal } from './SignaturePadModal';
 import { EmptyStateIllustration } from './EmptyStateIllustration';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 interface PlaceSignatureModalProps {
@@ -41,6 +42,7 @@ export function PlaceSignatureModal({
   onClearPageSignatures,
 }: PlaceSignatureModalProps) {
   const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [signatures, setSignatures] = useState<SignatureRecord[]>([]);
   const [selectedSig, setSelectedSig] = useState<SignatureRecord | null>(null);
   const [padVisible, setPadVisible] = useState(false);
@@ -48,10 +50,33 @@ export function PlaceSignatureModal({
   const [xRatio, setXRatio] = useState(0.55);
   const [yRatio, setYRatio] = useState(0.75);
   const [widthRatio, setWidthRatio] = useState(0.32);
+  const [isInteracting, setIsInteracting] = useState(false);
 
-  const [previewSize, setPreviewSize] = useState({ width: 260, height: 350 });
-  const dragStartRef = useRef({ x: 0.55, y: 0.75 });
-  const resizeStartRef = useRef({ w: 0.32, x: 0.55 });
+  const [pageAspect, setPageAspect] = useState(0.707);
+  const [sigAspectMap, setSigAspectMap] = useState<Record<string, number>>({});
+
+  const previewSize = useMemo(() => {
+    const maxW = 280;
+    const maxH = 360;
+    const boxRatio = maxW / maxH;
+    if (pageAspect > boxRatio) {
+      return { width: maxW, height: maxW / Math.max(0.15, pageAspect) };
+    }
+    return { width: maxH * pageAspect, height: maxH };
+  }, [pageAspect]);
+
+  const selectedSigAspect = selectedSig ? sigAspectMap[selectedSig.imageUri] ?? 0.46 : 0.46;
+
+  const stateRef = useRef({ xRatio, yRatio, widthRatio });
+  stateRef.current = { xRatio, yRatio, widthRatio };
+
+  const previewRef = useRef(previewSize);
+  previewRef.current = previewSize;
+
+  const aspectRef = useRef(selectedSigAspect);
+  aspectRef.current = selectedSigAspect;
+
+  const dragStartRef = useRef({ x: 0.55, y: 0.75, w: 0.32 });
 
   const loadSignatures = () => {
     const list = getSignatures();
@@ -68,8 +93,43 @@ export function PlaceSignatureModal({
       setXRatio(0.55);
       setYRatio(0.75);
       setWidthRatio(0.32);
+      setIsInteracting(false);
     }
   }, [visible]);
+
+  useEffect(() => {
+    if (!visible || !page?.imageUri) return;
+    let active = true;
+    Image.getSize(
+      page.imageUri,
+      (w, h) => {
+        if (active && w > 0 && h > 0) setPageAspect(w / h);
+      },
+      () => {}
+    );
+    return () => {
+      active = false;
+    };
+  }, [visible, page?.imageUri]);
+
+  useEffect(() => {
+    if (!visible) return;
+    const uris = new Set<string>();
+    if (selectedSig?.imageUri) uris.add(selectedSig.imageUri);
+    page?.signatures.forEach((s) => uris.add(s.imageUri));
+    uris.forEach((uri) => {
+      if (sigAspectMap[uri]) return;
+      Image.getSize(
+        uri,
+        (w, h) => {
+          if (w > 0 && h > 0) {
+            setSigAspectMap((prev) => ({ ...prev, [uri]: h / w }));
+          }
+        },
+        () => {}
+      );
+    });
+  }, [visible, selectedSig?.imageUri, page?.signatures]);
 
   const panResponder = useMemo(
     () =>
@@ -77,16 +137,28 @@ export function PlaceSignatureModal({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: () => {
-          dragStartRef.current = { x: xRatio, y: yRatio };
+          setIsInteracting(true);
+          dragStartRef.current = {
+            x: stateRef.current.xRatio,
+            y: stateRef.current.yRatio,
+            w: stateRef.current.widthRatio,
+          };
         },
         onPanResponderMove: (_, gesture) => {
-          const dx = gesture.dx / Math.max(1, previewSize.width);
-          const dy = gesture.dy / Math.max(1, previewSize.height);
-          setXRatio(Math.max(0.02, Math.min(0.96 - widthRatio, dragStartRef.current.x + dx)));
-          setYRatio(Math.max(0.02, Math.min(0.88, dragStartRef.current.y + dy)));
+          const w = Math.max(1, previewRef.current.width);
+          const h = Math.max(1, previewRef.current.height);
+          const dx = gesture.dx / w;
+          const dy = gesture.dy / h;
+          const sigHRatio = (dragStartRef.current.w * w * aspectRef.current) / h;
+          const maxX = Math.max(0.01, 0.99 - dragStartRef.current.w);
+          const maxY = Math.max(0.01, 0.99 - sigHRatio);
+          setXRatio(Math.max(0, Math.min(maxX, dragStartRef.current.x + dx)));
+          setYRatio(Math.max(0, Math.min(maxY, dragStartRef.current.y + dy)));
         },
+        onPanResponderRelease: () => setIsInteracting(false),
+        onPanResponderTerminate: () => setIsInteracting(false),
       }),
-    [previewSize.width, previewSize.height, xRatio, yRatio, widthRatio]
+    []
   );
 
   const resizeResponder = useMemo(
@@ -95,32 +167,45 @@ export function PlaceSignatureModal({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: () => {
-          resizeStartRef.current = { w: widthRatio, x: xRatio };
+          setIsInteracting(true);
+          dragStartRef.current = {
+            x: stateRef.current.xRatio,
+            y: stateRef.current.yRatio,
+            w: stateRef.current.widthRatio,
+          };
         },
         onPanResponderMove: (_, gesture) => {
-          const dw = gesture.dx / Math.max(1, previewSize.width);
+          const w = Math.max(1, previewRef.current.width);
+          const dw = gesture.dx / w;
           const next = Math.max(
-            0.14,
-            Math.min(0.75, Math.min(0.98 - resizeStartRef.current.x, resizeStartRef.current.w + dw))
+            0.12,
+            Math.min(0.85, Math.min(0.99 - dragStartRef.current.x, dragStartRef.current.w + dw))
           );
           setWidthRatio(next);
         },
+        onPanResponderRelease: () => setIsInteracting(false),
+        onPanResponderTerminate: () => setIsInteracting(false),
       }),
-    [previewSize.width, widthRatio, xRatio]
+    []
   );
 
   const handleDeleteSig = (sig: SignatureRecord) => {
-    Alert.alert('Eliminar firma', `¿Deseas borrar "${sig.name}"?`, [
-      { text: 'Cancelar', style: 'cancel' },
-      {
-        text: 'Eliminar',
-        style: 'destructive',
-        onPress: () => {
-          deleteSignatureRecord(sig.id);
-          loadSignatures();
+    Alert.alert(
+      'Eliminar firma',
+      `¿Deseas borrar "${sig.name}"? También se quitará de los documentos donde esté aplicada.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => {
+            deleteSignatureRecord(sig.id);
+            loadSignatures();
+          },
         },
-      },
-    ]);
+      ],
+      { cancelable: true }
+    );
   };
 
   const handleApply = () => {
@@ -151,14 +236,17 @@ export function PlaceSignatureModal({
             disabled={!selectedSig}
             style={[styles.applyBtn, !selectedSig && { opacity: 0.4 }]}
           >
-            <Text style={styles.applyBtnText}>Aplicar</Text>
+            <Text numberOfLines={1} style={styles.applyBtnText}>
+              Aplicar
+            </Text>
           </TouchableOpacity>
         </View>
 
         <ScrollView
+          scrollEnabled={!isInteracting}
           contentContainerStyle={[
             styles.scrollContent,
-            { paddingBottom: Math.max(30, insets.bottom + 16) },
+            { paddingBottom: Math.max(30, safeBottom + 16) },
           ]}
         >
           {page && (
@@ -168,35 +256,36 @@ export function PlaceSignatureModal({
               </Text>
               <View style={styles.canvasBackdrop}>
                 <View
-                  style={styles.pageFrame}
-                  onLayout={(e) => {
-                    const { width, height } = e.nativeEvent.layout;
-                    if (width > 0 && height > 0) {
-                      setPreviewSize({ width, height });
-                    }
-                  }}
+                  style={[
+                    styles.pageFrame,
+                    { width: previewSize.width, height: previewSize.height },
+                  ]}
                 >
                   <Image
                     source={{ uri: page.imageUri }}
                     style={[StyleSheet.absoluteFill, { borderRadius: 6 }]}
-                    resizeMode="contain"
+                    resizeMode="stretch"
                   />
 
-                  {page.signatures.map((existing) => (
-                    <Image
-                      key={existing.id}
-                      source={{ uri: existing.imageUri }}
-                      style={{
-                        position: 'absolute',
-                        left: existing.xRatio * previewSize.width,
-                        top: existing.yRatio * previewSize.height,
-                        width: existing.widthRatio * previewSize.width,
-                        height: existing.widthRatio * previewSize.width * 0.46,
-                        opacity: 0.85,
-                      }}
-                      resizeMode="contain"
-                    />
-                  ))}
+                  {page.signatures.map((existing) => {
+                    const ratio = sigAspectMap[existing.imageUri] ?? 0.46;
+                    const existingW = existing.widthRatio * previewSize.width;
+                    return (
+                      <Image
+                        key={existing.id}
+                        source={{ uri: existing.imageUri }}
+                        style={{
+                          position: 'absolute',
+                          left: existing.xRatio * previewSize.width,
+                          top: existing.yRatio * previewSize.height,
+                          width: existingW,
+                          height: existingW * ratio,
+                          opacity: 0.85,
+                        }}
+                        resizeMode="stretch"
+                      />
+                    );
+                  })}
 
                   {selectedSig && (
                     <View
@@ -206,7 +295,7 @@ export function PlaceSignatureModal({
                           left: xRatio * previewSize.width,
                           top: yRatio * previewSize.height,
                           width: widthRatio * previewSize.width,
-                          height: widthRatio * previewSize.width * 0.46,
+                          height: widthRatio * previewSize.width * selectedSigAspect,
                         },
                       ]}
                     >
@@ -214,7 +303,7 @@ export function PlaceSignatureModal({
                         <Image
                           source={{ uri: selectedSig.imageUri }}
                           style={styles.sigImg}
-                          resizeMode="contain"
+                          resizeMode="stretch"
                         />
                       </View>
                       <View {...resizeResponder.panHandlers} style={styles.resizeDot} />
@@ -228,27 +317,34 @@ export function PlaceSignatureModal({
                   style={styles.adjustChip}
                   onPress={() => {
                     Haptics.selectionAsync().catch(() => {});
-                    setWidthRatio((w) => Math.max(0.14, w - 0.05));
+                    setWidthRatio((w) => Math.max(0.12, w - 0.05));
                   }}
                 >
                   <Ionicons name="remove" size={16} color={COLORS.navy} />
-                  <Text style={styles.adjustText}>Más chica</Text>
+                  <Text numberOfLines={1} style={styles.adjustText}>
+                    Más chica
+                  </Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
                   style={styles.adjustChip}
                   onPress={() => {
                     Haptics.selectionAsync().catch(() => {});
-                    setWidthRatio((w) => Math.min(0.72, w + 0.05));
+                    setWidthRatio((w) => Math.min(0.8, w + 0.05));
                   }}
                 >
                   <Ionicons name="add" size={16} color={COLORS.navy} />
-                  <Text style={styles.adjustText}>Más grande</Text>
+                  <Text numberOfLines={1} style={styles.adjustText}>
+                    Más grande
+                  </Text>
                 </TouchableOpacity>
 
                 {page.signatures.length > 0 && (
                   <TouchableOpacity
-                    style={[styles.adjustChip, { backgroundColor: COLORS.dangerBg, borderColor: '#FECACA' }]}
+                    style={[
+                      styles.adjustChip,
+                      { backgroundColor: COLORS.dangerBg, borderColor: '#FECACA' },
+                    ]}
                     onPress={() => {
                       onClearPageSignatures();
                       onClose();
@@ -266,7 +362,9 @@ export function PlaceSignatureModal({
             <Text style={styles.sectionTitle}>Tus firmas ({signatures.length})</Text>
             <TouchableOpacity style={styles.newSigBtn} onPress={() => setPadVisible(true)}>
               <Ionicons name="add" size={16} color="#FFFFFF" />
-              <Text style={styles.newSigText}>Nueva firma</Text>
+              <Text numberOfLines={1} style={styles.newSigText}>
+                Nueva firma
+              </Text>
             </TouchableOpacity>
           </View>
 
@@ -317,6 +415,7 @@ export function PlaceSignatureModal({
             loadSignatures();
             setSelectedSig(created);
           }}
+          onChanged={loadSignatures}
         />
       </View>
     </Modal>
@@ -384,8 +483,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   pageFrame: {
-    width: 260,
-    height: 350,
     backgroundColor: '#FFFFFF',
     borderRadius: 6,
     overflow: 'visible',
@@ -399,7 +496,6 @@ const styles = StyleSheet.create({
     borderColor: COLORS.primary,
     backgroundColor: 'rgba(37, 99, 235, 0.08)',
     borderRadius: 6,
-    padding: 3,
   },
   sigImg: {
     width: '100%',

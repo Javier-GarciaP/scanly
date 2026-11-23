@@ -4,6 +4,8 @@ import {
   Alert,
   FlatList,
   Image,
+  Modal,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,7 +19,6 @@ import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
 import { scanDocument } from '../../modules/doc-engine';
 import {
-  copyImageToPermanentStorage,
   createDocument,
   createFolder,
   deleteDocument,
@@ -32,8 +33,10 @@ import { FolderModal } from '../components/FolderModal';
 import { RenameModal } from '../components/RenameModal';
 import { MoveFolderModal } from '../components/MoveFolderModal';
 import { SignaturePadModal } from '../components/SignaturePadModal';
+import { CropDocumentModal } from '../components/CropDocumentModal';
 import { ScanlyLogo } from '../components/ScanlyLogo';
 import { EmptyStateIllustration } from '../components/EmptyStateIllustration';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 type FilterValue = 'ALL' | 'SIGNED' | 'PROTECTED' | 'UNASSIGNED' | string;
@@ -60,6 +63,9 @@ function formatRelativeDate(ts: number): string {
 
   if (diffDays === 0) return 'Hoy';
   if (diffDays === 1) return 'Ayer';
+  if (d.getFullYear() !== now.getFullYear()) {
+    return `${d.getDate()} ${MONTHS_ES[d.getMonth()]} ${d.getFullYear()}`;
+  }
   return `${d.getDate()} ${MONTHS_ES[d.getMonth()]}`;
 }
 
@@ -74,6 +80,7 @@ export function HomeScreen({
   onOpenDocument,
 }: HomeScreenProps) {
   const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [scanning, setScanning] = useState(false);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [searchFocused, setSearchFocused] = useState(false);
@@ -81,9 +88,11 @@ export function HomeScreen({
   const [folderModalVisible, setFolderModalVisible] = useState(false);
   const [editingFolder, setEditingFolder] = useState<Folder | null>(null);
 
+  const [optionsDoc, setOptionsDoc] = useState<DocumentRecord | null>(null);
   const [renamingDoc, setRenamingDoc] = useState<DocumentRecord | null>(null);
   const [movingDoc, setMovingDoc] = useState<DocumentRecord | null>(null);
   const [signaturePadOpen, setSignaturePadOpen] = useState(false);
+  const [pendingCropUris, setPendingCropUris] = useState<string[] | null>(null);
 
   const targetFolderForNewScan = useMemo(() => {
     if (
@@ -117,6 +126,24 @@ export function HomeScreen({
     setViewMode((prev) => (prev === 'grid' ? 'list' : 'grid'));
   };
 
+  const launchCameraFallback = async () => {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert(
+        'Permiso de cámara requerido',
+        'Activa el permiso de cámara para Scanly en los ajustes de tu teléfono.'
+      );
+      return;
+    }
+    const camRes = await ImagePicker.launchCameraAsync({
+      mediaTypes: ['images'],
+      quality: 0.95,
+    });
+    if (!camRes.canceled && camRes.assets.length > 0) {
+      setPendingCropUris(camRes.assets.map((a) => a.uri));
+    }
+  };
+
   const handleScanNew = async () => {
     try {
       setScanning(true);
@@ -128,11 +155,17 @@ export function HomeScreen({
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       onRefresh();
       onOpenDocument(docId);
-    } catch (err) {
-      Alert.alert(
-        'No se pudo abrir el escáner',
-        err instanceof Error ? err.message : 'Verifica los permisos de cámara e intenta de nuevo.'
-      );
+    } catch {
+      try {
+        await launchCameraFallback();
+      } catch (fallbackErr) {
+        Alert.alert(
+          'No se pudo abrir la cámara',
+          fallbackErr instanceof Error
+            ? fallbackErr.message
+            : 'Verifica los permisos de cámara e intenta de nuevo.'
+        );
+      }
     } finally {
       setScanning(false);
     }
@@ -143,15 +176,12 @@ export function HomeScreen({
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
         allowsMultipleSelection: true,
-        quality: 0.92,
+        quality: 0.95,
       });
       if (result.canceled || result.assets.length === 0) return;
 
-      const savedUris = result.assets.map((asset) => copyImageToPermanentStorage(asset.uri));
-      const docId = createDocument(formatDefaultDocTitle(), savedUris, targetFolderForNewScan);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      onRefresh();
-      onOpenDocument(docId);
+      // Abrir detector de bordes y recorte de perspectiva para cada imagen seleccionada
+      setPendingCropUris(result.assets.map((asset) => asset.uri));
     } catch (err) {
       Alert.alert(
         'Error al importar',
@@ -162,38 +192,26 @@ export function HomeScreen({
 
   const handleDocOptions = (doc: DocumentRecord) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
-    Alert.alert(doc.title, 'Selecciona una acción', [
-      {
-        text: 'Renombrar',
-        onPress: () => setRenamingDoc(doc),
-      },
-      {
-        text: 'Mover a carpeta',
-        onPress: () => setMovingDoc(doc),
-      },
-      {
-        text: 'Eliminar documento',
-        style: 'destructive',
-        onPress: () => {
-          Alert.alert(
-            'Eliminar documento',
-            `Se eliminarán "${doc.title}" y todas sus hojas (${doc.pageCount}).`,
-            [
-              { text: 'Cancelar', style: 'cancel' },
-              {
-                text: 'Eliminar',
-                style: 'destructive',
-                onPress: () => {
-                  deleteDocument(doc.id);
-                  onRefresh();
-                },
-              },
-            ]
-          );
+    setOptionsDoc(doc);
+  };
+
+  const confirmDeleteDoc = (doc: DocumentRecord) => {
+    Alert.alert(
+      'Eliminar documento',
+      `Se eliminarán "${doc.title}" y todas sus hojas (${doc.pageCount}).`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => {
+            deleteDocument(doc.id);
+            onRefresh();
+          },
         },
-      },
-      { text: 'Cancelar', style: 'cancel' },
-    ]);
+      ],
+      { cancelable: true }
+    );
   };
 
   const renderGridCard = ({ item }: { item: DocumentRecord }) => {
@@ -250,12 +268,10 @@ export function HomeScreen({
             <Text numberOfLines={1} style={styles.gridMetaText}>
               {formatRelativeDate(item.updatedAt)}
               {hasOcr ? ' · OCR' : ''}
-              {isSigned && !hasOcr ? ' · Firmado' : ''}
+              {isSigned ? ' · Firmado' : ''}
             </Text>
             <View style={styles.gridMetaIcons}>
-              {isSigned && (
-                <Ionicons name="pencil" size={11} color={COLORS.primary} />
-              )}
+              {isSigned && <Ionicons name="pencil" size={11} color={COLORS.primary} />}
               {item.isPasswordProtected && (
                 <Ionicons name="lock-closed" size={12} color={COLORS.warning} />
               )}
@@ -357,10 +373,10 @@ export function HomeScreen({
           <TouchableOpacity
             style={styles.headerIconBtn}
             onPress={handleToggleViewMode}
-            accessibilityLabel="Cambiar vista"
+            accessibilityLabel={viewMode === 'grid' ? 'Ver como lista' : 'Ver como cuadrícula'}
           >
             <Ionicons
-              name={viewMode === 'grid' ? 'grid-outline' : 'list-outline'}
+              name={viewMode === 'grid' ? 'list-outline' : 'grid-outline'}
               size={18}
               color={COLORS.navy}
             />
@@ -421,22 +437,6 @@ export function HomeScreen({
             </Text>
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.chip, activeFolder === 'PROTECTED' && styles.chipActive]}
-            onPress={() => handleSelectFilter('PROTECTED')}
-          >
-            <Ionicons
-              name="lock-closed"
-              size={13}
-              color={activeFolder === 'PROTECTED' ? '#FFFFFF' : COLORS.textSecondary}
-            />
-            <Text
-              style={[styles.chipText, activeFolder === 'PROTECTED' && styles.chipTextActive]}
-            >
-              Protegidos
-            </Text>
-          </TouchableOpacity>
-
           {folders.map((folder) => {
             const selected = activeFolder === folder.id;
             return (
@@ -455,7 +455,7 @@ export function HomeScreen({
                     { backgroundColor: selected ? '#FFFFFF' : folder.color },
                   ]}
                 />
-                <Text style={[styles.chipText, selected && styles.chipTextActive]}>
+                <Text numberOfLines={1} style={[styles.chipText, selected && styles.chipTextActive]}>
                   {folder.name}
                 </Text>
                 {(folder.documentCount ?? 0) > 0 && (
@@ -466,17 +466,6 @@ export function HomeScreen({
               </TouchableOpacity>
             );
           })}
-
-          <TouchableOpacity
-            style={[styles.chip, activeFolder === 'UNASSIGNED' && styles.chipActive]}
-            onPress={() => handleSelectFilter('UNASSIGNED')}
-          >
-            <Text
-              style={[styles.chipText, activeFolder === 'UNASSIGNED' && styles.chipTextActive]}
-            >
-              Sin carpeta
-            </Text>
-          </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.addFolderChip}
@@ -502,7 +491,7 @@ export function HomeScreen({
         contentContainerStyle={[
           styles.listContent,
           documents.length === 0 && styles.listContentEmpty,
-          { paddingBottom: 122 + insets.bottom },
+          { paddingBottom: 122 + safeBottom },
         ]}
         ListHeaderComponent={
           documents.length > 0 ? (
@@ -543,7 +532,7 @@ export function HomeScreen({
       />
 
       {/* Bottom Floating Action Cluster */}
-      <View style={[styles.fabCluster, { bottom: 18 + insets.bottom }]} pointerEvents="box-none">
+      <View style={[styles.fabCluster, { bottom: 18 + safeBottom }]} pointerEvents="box-none">
         <TouchableOpacity
           style={styles.galleryFab}
           onPress={handleImportGallery}
@@ -570,6 +559,102 @@ export function HomeScreen({
           )}
         </TouchableOpacity>
       </View>
+
+      {/* Document Options Bottom Sheet (replaces 4-button Android Alert) */}
+      <Modal
+        visible={optionsDoc !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setOptionsDoc(null)}
+      >
+        <Pressable style={styles.optionsBackdrop} onPress={() => setOptionsDoc(null)}>
+          <Pressable
+            style={[styles.optionsSheet, { paddingBottom: Math.max(22, safeBottom + 12) }]}
+            onPress={() => {}}
+          >
+            <View style={styles.optionsHandle} />
+            <Text numberOfLines={1} style={styles.optionsTitle}>
+              {optionsDoc?.title ?? ''}
+            </Text>
+            <Text style={styles.optionsSubtitle}>
+              {optionsDoc
+                ? `${optionsDoc.pageCount} ${optionsDoc.pageCount === 1 ? 'página' : 'páginas'}`
+                : ''}
+            </Text>
+
+            <TouchableOpacity
+              style={styles.optionRow}
+              onPress={() => {
+                const target = optionsDoc;
+                setOptionsDoc(null);
+                if (target) setRenamingDoc(target);
+              }}
+            >
+              <View style={styles.optionIconBox}>
+                <Ionicons name="pencil-outline" size={18} color={COLORS.navy} />
+              </View>
+              <Text style={styles.optionRowText}>Renombrar</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionRow}
+              onPress={() => {
+                const target = optionsDoc;
+                setOptionsDoc(null);
+                if (target) setMovingDoc(target);
+              }}
+            >
+              <View style={styles.optionIconBox}>
+                <Ionicons name="folder-outline" size={18} color={COLORS.navy} />
+              </View>
+              <Text style={styles.optionRowText}>Mover a carpeta</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionRow}
+              onPress={() => {
+                const target = optionsDoc;
+                setOptionsDoc(null);
+                if (target) confirmDeleteDoc(target);
+              }}
+            >
+              <View style={[styles.optionIconBox, { backgroundColor: COLORS.dangerBg }]}>
+                <Ionicons name="trash-outline" size={18} color={COLORS.danger} />
+              </View>
+              <Text style={[styles.optionRowText, { color: COLORS.danger }]}>
+                Eliminar documento
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionCancelBtn}
+              onPress={() => setOptionsDoc(null)}
+            >
+              <Text style={styles.optionCancelText}>Cancelar</Text>
+            </TouchableOpacity>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Sheet Cropper Modal for gallery imports & camera fallback */}
+      <CropDocumentModal
+        visible={pendingCropUris !== null && pendingCropUris.length > 0}
+        imageUris={pendingCropUris ?? []}
+        title="Recortar hoja"
+        onCancel={() => setPendingCropUris(null)}
+        onComplete={(croppedUris) => {
+          setPendingCropUris(null);
+          if (croppedUris.length === 0) return;
+          const docId = createDocument(
+            formatDefaultDocTitle(),
+            croppedUris,
+            targetFolderForNewScan
+          );
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          onRefresh();
+          onOpenDocument(docId);
+        }}
+      />
 
       {/* Modals */}
       <FolderModal
@@ -610,7 +695,8 @@ export function HomeScreen({
                         onRefresh();
                       },
                     },
-                  ]
+                  ],
+                  { cancelable: true }
                 );
               }
             : undefined
@@ -644,10 +730,12 @@ export function HomeScreen({
 
       <SignaturePadModal
         visible={signaturePadOpen}
+        initialTab="saved"
         onClose={() => setSignaturePadOpen(false)}
         onCreated={() => {
           Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
         }}
+        onChanged={onRefresh}
       />
     </View>
   );
@@ -790,11 +878,6 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     letterSpacing: 0.9,
   },
-  sectionHeaderSub: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: COLORS.textMuted,
-  },
   listContent: {
     paddingHorizontal: 18,
   },
@@ -903,7 +986,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 5,
   },
-  // List view card
   listCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -979,7 +1061,6 @@ const styles = StyleSheet.create({
   listMoreBtn: {
     padding: 6,
   },
-  // Empty state
   emptyState: {
     alignItems: 'center',
     justifyContent: 'center',
@@ -1000,7 +1081,6 @@ const styles = StyleSheet.create({
     color: COLORS.textMuted,
     textAlign: 'center',
   },
-  // Floating Action Cluster
   fabCluster: {
     position: 'absolute',
     right: 18,
@@ -1036,5 +1116,72 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
     letterSpacing: -0.1,
+  },
+  // Document Options Sheet
+  optionsBackdrop: {
+    flex: 1,
+    backgroundColor: COLORS.overlay,
+    justifyContent: 'flex-end',
+  },
+  optionsSheet: {
+    backgroundColor: COLORS.surface,
+    borderTopLeftRadius: 26,
+    borderTopRightRadius: 26,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+  },
+  optionsHandle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#CBD5E1',
+    alignSelf: 'center',
+    marginBottom: 14,
+  },
+  optionsTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: COLORS.navy,
+  },
+  optionsSubtitle: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: COLORS.textMuted,
+    marginTop: 2,
+    marginBottom: 14,
+  },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 8,
+    borderRadius: 12,
+  },
+  optionIconBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: COLORS.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  optionRowText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: COLORS.navy,
+  },
+  optionCancelBtn: {
+    marginTop: 10,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: COLORS.surfaceMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  optionCancelText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
   },
 });

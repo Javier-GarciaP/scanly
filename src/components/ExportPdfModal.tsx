@@ -6,6 +6,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -13,7 +14,6 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import { File } from 'expo-file-system';
@@ -24,8 +24,9 @@ import {
   type PageSizeOption,
   type SignatureOverlayInput,
 } from '../../modules/doc-engine';
-import { getPdfOutputPath, renameDocument, updateDocumentPdf } from '../storage/database';
+import { getPdfOutputPath, updateDocumentPdf } from '../storage/database';
 import type { DocumentDetail } from '../types/models';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 interface ExportPdfModalProps {
@@ -47,7 +48,7 @@ export function ExportPdfModal({
   onClose,
   onExported,
 }: ExportPdfModalProps) {
-  const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [fileName, setFileName] = useState('');
   const [pageSize, setPageSize] = useState<PageSizeOption>('A4');
   const [protectPdf, setProtectPdf] = useState(false);
@@ -58,7 +59,7 @@ export function ExportPdfModal({
   useEffect(() => {
     if (visible && document) {
       setFileName(document.title.replace(/\.pdf$/i, ''));
-      setProtectPdf(document.isPasswordProtected);
+      setProtectPdf(false);
       setPassword('');
       setShowPassword(false);
       setBusyAction(null);
@@ -88,10 +89,7 @@ export function ExportPdfModal({
       return null;
     }
 
-    const finalTitle = cleanExportName();
-    if (finalTitle !== document.title) {
-      renameDocument(document.id, finalTitle);
-    }
+    const finalExportName = cleanExportName();
 
     const signatures: SignatureOverlayInput[] = [];
     document.pages.forEach((p, idx) => {
@@ -106,7 +104,7 @@ export function ExportPdfModal({
       });
     });
 
-    const outputPath = getPdfOutputPath(document.id, finalTitle);
+    const outputPath = getPdfOutputPath(document.id, finalExportName);
     const result = await generatePdf({
       imageUris: document.pages.map((p) => p.imageUri),
       outputPath,
@@ -117,7 +115,7 @@ export function ExportPdfModal({
 
     updateDocumentPdf(document.id, result.uri, protectPdf);
     onExported();
-    return { uri: result.uri, name: finalTitle };
+    return { uri: result.uri, name: finalExportName };
   };
 
   const handleSaveDownloads = async () => {
@@ -132,7 +130,8 @@ export function ExportPdfModal({
       Alert.alert(
         'PDF guardado',
         `Se guardó sin marcas de agua en:\n${res.savedPath}`,
-        [{ text: 'Listo', onPress: onClose }]
+        [{ text: 'Listo', onPress: onClose }],
+        { cancelable: true }
       );
     } catch (err) {
       Alert.alert(
@@ -198,11 +197,11 @@ export function ExportPdfModal({
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
         <Pressable style={styles.backdrop} onPress={onClose}>
           <Pressable
-            style={[styles.sheet, { paddingBottom: Math.max(24, insets.bottom + 14) }]}
+            style={[styles.sheet, { paddingBottom: Math.max(24, safeBottom + 14) }]}
             onPress={() => {}}
           >
             <View style={styles.handle} />
@@ -215,172 +214,178 @@ export function ExportPdfModal({
               </TouchableOpacity>
             </View>
 
-            {/* Filename Field */}
-            <Text style={styles.fieldLabel}>Nombre del archivo</Text>
-            <View style={styles.fileInputWrap}>
-              <TextInput
-                value={fileName}
-                onChangeText={setFileName}
-                placeholder="Nombre del documento"
-                placeholderTextColor={COLORS.textMuted}
-                style={styles.fileInput}
-                maxLength={70}
-              />
-              <View style={styles.pdfExtPill}>
-                <Text style={styles.pdfExtText}>.pdf</Text>
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              bounces={false}
+            >
+              {/* Filename Field */}
+              <Text style={styles.fieldLabel}>Nombre del archivo</Text>
+              <View style={styles.fileInputWrap}>
+                <TextInput
+                  value={fileName}
+                  onChangeText={setFileName}
+                  placeholder="Nombre del documento"
+                  placeholderTextColor={COLORS.textMuted}
+                  style={styles.fileInput}
+                  maxLength={70}
+                />
+                <View style={styles.pdfExtPill}>
+                  <Text style={styles.pdfExtText}>.pdf</Text>
+                </View>
               </View>
-            </View>
 
-            {/* Page Size Segmented Control */}
-            <Text style={styles.fieldLabel}>Tamaño de página</Text>
-            <View style={styles.segmentTrack}>
-              {PAGE_SIZES.map((item) => {
-                const selected = pageSize === item.value;
-                return (
-                  <TouchableOpacity
-                    key={item.value}
-                    style={[styles.segmentBtn, selected && styles.segmentBtnActive]}
-                    onPress={() => {
-                      Haptics.selectionAsync().catch(() => {});
-                      setPageSize(item.value);
-                    }}
-                  >
-                    <Text
-                      style={[
-                        styles.segmentText,
-                        selected && styles.segmentTextActive,
-                      ]}
+              {/* Page Size Segmented Control */}
+              <Text style={styles.fieldLabel}>Tamaño de página</Text>
+              <View style={styles.segmentTrack}>
+                {PAGE_SIZES.map((item) => {
+                  const selected = pageSize === item.value;
+                  return (
+                    <TouchableOpacity
+                      key={item.value}
+                      style={[styles.segmentBtn, selected && styles.segmentBtnActive]}
+                      onPress={() => {
+                        Haptics.selectionAsync().catch(() => {});
+                        setPageSize(item.value);
+                      }}
                     >
-                      {item.label}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-
-            {/* Security Card */}
-            <View style={styles.securityCard}>
-              <View style={styles.securityTopRow}>
-                <View style={styles.securityTitleRow}>
-                  <Ionicons
-                    name={protectPdf ? 'lock-closed' : 'lock-open-outline'}
-                    size={19}
-                    color={protectPdf ? COLORS.warning : COLORS.textSecondary}
-                  />
-                  <Text style={styles.securityTitle}>Proteger con contraseña</Text>
-                </View>
-
-                <Switch
-                  value={protectPdf}
-                  onValueChange={(v) => {
-                    Haptics.selectionAsync().catch(() => {});
-                    setProtectPdf(v);
-                  }}
-                  trackColor={{ false: '#CBD5E1', true: COLORS.primary }}
-                  thumbColor="#FFFFFF"
-                />
+                      <Text style={[styles.segmentText, selected && styles.segmentTextActive]}>
+                        {item.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
               </View>
 
-              {protectPdf && (
-                <View style={styles.passwordWrap}>
-                  <TextInput
-                    value={password}
-                    onChangeText={setPassword}
-                    placeholder="Contraseña (mín. 4 caracteres)"
-                    placeholderTextColor={COLORS.textMuted}
-                    secureTextEntry={!showPassword}
-                    autoCapitalize="none"
-                    style={styles.passwordInput}
-                  />
-                  <TouchableOpacity
-                    onPress={() => setShowPassword((v) => !v)}
-                    style={styles.eyeBtn}
-                    hitSlop={8}
-                  >
+              {/* Security Card */}
+              <View style={styles.securityCard}>
+                <View style={styles.securityTopRow}>
+                  <View style={styles.securityTitleRow}>
                     <Ionicons
-                      name={showPassword ? 'eye-outline' : 'eye-off-outline'}
+                      name={protectPdf ? 'lock-closed' : 'lock-open-outline'}
                       size={19}
-                      color={COLORS.textMuted}
+                      color={protectPdf ? COLORS.warning : COLORS.textSecondary}
                     />
-                  </TouchableOpacity>
+                    <Text style={styles.securityTitle}>Proteger con contraseña</Text>
+                  </View>
+
+                  <Switch
+                    value={protectPdf}
+                    onValueChange={(v) => {
+                      Haptics.selectionAsync().catch(() => {});
+                      setProtectPdf(v);
+                    }}
+                    trackColor={{ false: '#CBD5E1', true: COLORS.primary }}
+                    thumbColor="#FFFFFF"
+                  />
                 </View>
-              )}
 
-              <View style={styles.securityFootnote}>
-                <Ionicons
-                  name="shield-checkmark"
-                  size={15}
-                  color={protectPdf ? COLORS.success : COLORS.textMuted}
-                />
-                <Text
-                  style={[
-                    styles.securityFootnoteText,
-                    protectPdf && { color: COLORS.success },
-                  ]}
-                >
-                  Cifrado estándar AES 128-bit
-                </Text>
+                {protectPdf && (
+                  <View style={styles.passwordWrap}>
+                    <TextInput
+                      value={password}
+                      onChangeText={setPassword}
+                      placeholder="Contraseña (mín. 4 caracteres)"
+                      placeholderTextColor={COLORS.textMuted}
+                      secureTextEntry={!showPassword}
+                      autoCapitalize="none"
+                      style={styles.passwordInput}
+                    />
+                    <TouchableOpacity
+                      onPress={() => setShowPassword((v) => !v)}
+                      style={styles.eyeBtn}
+                      hitSlop={8}
+                    >
+                      <Ionicons
+                        name={showPassword ? 'eye-outline' : 'eye-off-outline'}
+                        size={19}
+                        color={COLORS.textMuted}
+                      />
+                    </TouchableOpacity>
+                  </View>
+                )}
+
+                <View style={styles.securityFootnote}>
+                  <Ionicons
+                    name="shield-checkmark"
+                    size={15}
+                    color={protectPdf ? COLORS.success : COLORS.textMuted}
+                  />
+                  <Text
+                    style={[
+                      styles.securityFootnoteText,
+                      protectPdf && { color: COLORS.success },
+                    ]}
+                  >
+                    Cifrado estándar AES 128-bit
+                    {document?.isPasswordProtected && !protectPdf
+                      ? ' · Activa para cifrar esta exportación'
+                      : ''}
+                  </Text>
+                </View>
               </View>
-            </View>
 
-            {/* Summary Row */}
-            <Text style={styles.summaryText}>
-              {pageCount} {pageCount === 1 ? 'página' : 'páginas'}
-              {totalSignatures > 0
-                ? ` · ${totalSignatures} ${totalSignatures === 1 ? 'firma aplicada' : 'firmas aplicadas'}`
-                : ''}{' '}
-              · Sin marca de agua
-            </Text>
+              {/* Summary Row */}
+              <Text style={styles.summaryText}>
+                {pageCount} {pageCount === 1 ? 'página' : 'páginas'}
+                {totalSignatures > 0
+                  ? ` · ${totalSignatures} ${
+                      totalSignatures === 1 ? 'firma aplicada' : 'firmas aplicadas'
+                    }`
+                  : ''}{' '}
+                · Sin marca de agua
+              </Text>
 
-            {/* Stacked Actions */}
-            <View style={styles.actions}>
-              <TouchableOpacity
-                style={styles.primaryNavyBtn}
-                onPress={handleSaveDownloads}
-                disabled={busyAction !== null}
-                activeOpacity={0.88}
-              >
-                {busyAction === 'download' ? (
-                  <ActivityIndicator color="#FFFFFF" />
-                ) : (
-                  <>
-                    <Ionicons name="download-outline" size={20} color="#FFFFFF" />
-                    <Text style={styles.primaryNavyBtnText}>Guardar en Descargas</Text>
-                  </>
-                )}
-              </TouchableOpacity>
+              {/* Stacked Actions */}
+              <View style={styles.actions}>
+                <TouchableOpacity
+                  style={styles.primaryNavyBtn}
+                  onPress={handleSaveDownloads}
+                  disabled={busyAction !== null}
+                  activeOpacity={0.88}
+                >
+                  {busyAction === 'download' ? (
+                    <ActivityIndicator color="#FFFFFF" />
+                  ) : (
+                    <>
+                      <Ionicons name="download-outline" size={20} color="#FFFFFF" />
+                      <Text style={styles.primaryNavyBtnText}>Guardar en Descargas</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
 
-              <TouchableOpacity
-                style={styles.secondaryOutlineBtn}
-                onPress={handleShare}
-                disabled={busyAction !== null}
-                activeOpacity={0.85}
-              >
-                {busyAction === 'share' ? (
-                  <ActivityIndicator color={COLORS.navy} />
-                ) : (
-                  <>
-                    <Ionicons name="share-social-outline" size={19} color={COLORS.navy} />
-                    <Text style={styles.secondaryOutlineBtnText}>Compartir PDF</Text>
-                  </>
-                )}
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.secondaryOutlineBtn}
+                  onPress={handleShare}
+                  disabled={busyAction !== null}
+                  activeOpacity={0.85}
+                >
+                  {busyAction === 'share' ? (
+                    <ActivityIndicator color={COLORS.navy} />
+                  ) : (
+                    <>
+                      <Ionicons name="share-social-outline" size={19} color={COLORS.navy} />
+                      <Text style={styles.secondaryOutlineBtnText}>Compartir PDF</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
 
-              <TouchableOpacity
-                style={styles.previewLinkBtn}
-                onPress={handlePreview}
-                disabled={busyAction !== null}
-              >
-                {busyAction === 'preview' ? (
-                  <ActivityIndicator size="small" color={COLORS.textSecondary} />
-                ) : (
-                  <>
-                    <Ionicons name="open-outline" size={15} color={COLORS.textSecondary} />
-                    <Text style={styles.previewLinkText}>Abrir vista previa del PDF</Text>
-                  </>
-                )}
-              </TouchableOpacity>
-            </View>
+                <TouchableOpacity
+                  style={styles.previewLinkBtn}
+                  onPress={handlePreview}
+                  disabled={busyAction !== null}
+                >
+                  {busyAction === 'preview' ? (
+                    <ActivityIndicator size="small" color={COLORS.textSecondary} />
+                  ) : (
+                    <>
+                      <Ionicons name="open-outline" size={15} color={COLORS.textSecondary} />
+                      <Text style={styles.previewLinkText}>Abrir vista previa del PDF</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </KeyboardAvoidingView>
@@ -395,6 +400,7 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   sheet: {
+    maxHeight: '90%',
     backgroundColor: COLORS.surface,
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
@@ -541,6 +547,7 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
   securityFootnoteText: {
+    flex: 1,
     fontSize: 12,
     fontWeight: '600',
     color: COLORS.textSecondary,

@@ -10,6 +10,33 @@ export type ScanResult = {
   pageUris: string[];
 };
 
+export type NormalizedCorner = {
+  x: number;
+  y: number;
+};
+
+export type DetectCornersResult = {
+  width: number;
+  height: number;
+  detected: boolean;
+  corners: [NormalizedCorner, NormalizedCorner, NormalizedCorner, NormalizedCorner];
+};
+
+export type DocumentFilterOption = 'original' | 'document' | 'grayscale' | 'bw';
+
+export type CropDocumentOptions = {
+  imageUri: string;
+  corners: [NormalizedCorner, NormalizedCorner, NormalizedCorner, NormalizedCorner];
+  filter?: DocumentFilterOption;
+  outputPath?: string;
+};
+
+export type CropDocumentResult = {
+  uri: string;
+  width: number;
+  height: number;
+};
+
 export type OcrBlock = {
   text: string;
 };
@@ -48,8 +75,14 @@ export type StrokePoint = {
   y: number;
 };
 
+export type StyledStroke = {
+  points: StrokePoint[];
+  color: string;
+  width: number;
+};
+
 export type RenderSignatureOptions = {
-  strokes: StrokePoint[][];
+  strokes: StrokePoint[][] | StyledStroke[];
   width: number;
   height: number;
   strokeColor: string;
@@ -63,6 +96,8 @@ export type SaveToDownloadsResult = {
 
 interface NativeDocEngineModule {
   scanDocument(options: ScanOptions): Promise<ScanResult>;
+  detectDocumentCorners(imageUri: string): Promise<DetectCornersResult>;
+  cropDocumentPerspective(options: CropDocumentOptions): Promise<CropDocumentResult>;
   recognizeText(imageUri: string): Promise<OcrResult>;
   generatePdf(options: GeneratePdfOptions): Promise<GeneratePdfResult>;
   renderSignaturePng(options: RenderSignatureOptions): Promise<string>;
@@ -87,6 +122,16 @@ export async function scanDocument(options: ScanOptions = {}): Promise<ScanResul
     pageLimit: options.pageLimit ?? 25,
     galleryImportAllowed: options.galleryImportAllowed ?? true,
   });
+}
+
+export async function detectDocumentCorners(imageUri: string): Promise<DetectCornersResult> {
+  return ensureNative().detectDocumentCorners(imageUri);
+}
+
+export async function cropDocumentPerspective(
+  options: CropDocumentOptions
+): Promise<CropDocumentResult> {
+  return ensureNative().cropDocumentPerspective(options);
 }
 
 export async function recognizeText(imageUri: string): Promise<OcrResult> {

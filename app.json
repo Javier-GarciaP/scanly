@@ -28,7 +28,8 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Permite importar fotos de documentos desde tu galería."
+          "photosPermission": "Permite importar fotos de documentos desde tu galería.",
+          "cameraPermission": "Permite usar la cámara para escanear documentos."
         }
       ],
       "expo-sharing"

@@ -3,8 +3,10 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  KeyboardAvoidingView,
   Modal,
   PanResponder,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,7 +18,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Line, Path } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
-import { renderSignaturePng, type StrokePoint } from '../../modules/doc-engine';
+import {
+  renderSignaturePng,
+  type StrokePoint,
+  type StyledStroke,
+} from '../../modules/doc-engine';
 import {
   deleteSignatureRecord,
   getSignatureOutputPath,
@@ -25,6 +31,7 @@ import {
 } from '../storage/database';
 import type { SignatureRecord } from '../types/models';
 import { EmptyStateIllustration } from './EmptyStateIllustration';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS, SHADOWS } from '../theme/colors';
 
 interface SignaturePadModalProps {
@@ -32,6 +39,7 @@ interface SignaturePadModalProps {
   initialTab?: 'saved' | 'new';
   onClose: () => void;
   onCreated: (signature: SignatureRecord) => void;
+  onChanged?: () => void;
 }
 
 const INK_COLORS = [
@@ -52,16 +60,19 @@ function strokeToSvgPath(points: StrokePoint[]): string {
     const p = points[0];
     return `M ${p.x.toFixed(1)} ${p.y.toFixed(1)} L ${(p.x + 0.5).toFixed(1)} ${(p.y + 0.5).toFixed(1)}`;
   }
+  // Catmull-Rom: the curve passes through every sampled point, so the ink keeps its shape.
   let d = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
-  for (let i = 1; i < points.length; i++) {
-    const prev = points[i - 1];
-    const curr = points[i];
-    const midX = (prev.x + curr.x) / 2;
-    const midY = (prev.y + curr.y) / 2;
-    d += ` Q ${prev.x.toFixed(1)} ${prev.y.toFixed(1)} ${midX.toFixed(1)} ${midY.toFixed(1)}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i - 1] ?? points[i];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2] ?? p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6;
+    const c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6;
+    const c2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)} ${c2x.toFixed(1)} ${c2y.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
   }
-  const last = points[points.length - 1];
-  d += ` L ${last.x.toFixed(1)} ${last.y.toFixed(1)}`;
   return d;
 }
 
@@ -70,31 +81,49 @@ export function SignaturePadModal({
   initialTab = 'new',
   onClose,
   onCreated,
+  onChanged,
 }: SignaturePadModalProps) {
   const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
   const [activeTab, setActiveTab] = useState<'saved' | 'new'>(initialTab);
   const [savedSignatures, setSavedSignatures] = useState<SignatureRecord[]>([]);
 
   const [name, setName] = useState('');
   const [inkColor, setInkColor] = useState(INK_COLORS[0].value);
   const [strokeWidth, setStrokeWidth] = useState(STROKE_WIDTHS[1].value);
-  const [strokes, setStrokes] = useState<StrokePoint[][]>([]);
+  const [strokes, setStrokes] = useState<StyledStroke[]>([]);
   const [currentStroke, setCurrentStroke] = useState<StrokePoint[]>([]);
+  const [drawing, setDrawing] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 320, height: 240 });
   const [saving, setSaving] = useState(false);
 
   const currentStrokeRef = useRef<StrokePoint[]>([]);
+  const styleRef = useRef({ color: inkColor, width: strokeWidth });
+  styleRef.current = { color: inkColor, width: strokeWidth };
+  const canvasSizeRef = useRef(canvasSize);
+  canvasSizeRef.current = canvasSize;
 
   const loadSaved = () => {
-    setSavedSignatures(getSignatures());
+    const list = getSignatures();
+    setSavedSignatures(list);
+    return list;
   };
 
   useEffect(() => {
     if (visible) {
-      loadSaved();
-      setActiveTab(initialTab);
+      const list = loadSaved();
+      if (initialTab === 'saved' && list.length === 0) {
+        setActiveTab('new');
+      } else {
+        setActiveTab(initialTab);
+      }
     }
   }, [visible, initialTab]);
+
+  const clampPoint = (x: number, y: number): StrokePoint => ({
+    x: Math.max(0, Math.min(canvasSizeRef.current.width, x)),
+    y: Math.max(0, Math.min(canvasSizeRef.current.height, y)),
+  });
 
   const panResponder = useMemo(
     () =>
@@ -102,14 +131,15 @@ export function SignaturePadModal({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: (evt) => {
+          setDrawing(true);
           const { locationX, locationY } = evt.nativeEvent;
-          const pt = { x: locationX, y: locationY };
+          const pt = clampPoint(locationX, locationY);
           currentStrokeRef.current = [pt];
           setCurrentStroke([pt]);
         },
         onPanResponderMove: (evt) => {
           const { locationX, locationY } = evt.nativeEvent;
-          const pt = { x: locationX, y: locationY };
+          const pt = clampPoint(locationX, locationY);
           const prev = currentStrokeRef.current[currentStrokeRef.current.length - 1];
           if (prev && Math.hypot(pt.x - prev.x, pt.y - prev.y) < 1.5) {
             return;
@@ -118,16 +148,26 @@ export function SignaturePadModal({
           setCurrentStroke(currentStrokeRef.current);
         },
         onPanResponderRelease: () => {
+          setDrawing(false);
           if (currentStrokeRef.current.length > 0) {
-            const finished = currentStrokeRef.current;
+            const finished: StyledStroke = {
+              points: currentStrokeRef.current,
+              color: styleRef.current.color,
+              width: styleRef.current.width,
+            };
             setStrokes((prev) => [...prev, finished]);
           }
           currentStrokeRef.current = [];
           setCurrentStroke([]);
         },
         onPanResponderTerminate: () => {
+          setDrawing(false);
           if (currentStrokeRef.current.length > 0) {
-            const finished = currentStrokeRef.current;
+            const finished: StyledStroke = {
+              points: currentStrokeRef.current,
+              color: styleRef.current.color,
+              width: styleRef.current.width,
+            };
             setStrokes((prev) => [...prev, finished]);
           }
           currentStrokeRef.current = [];
@@ -150,17 +190,23 @@ export function SignaturePadModal({
   };
 
   const handleDeleteSaved = (sig: SignatureRecord) => {
-    Alert.alert('Eliminar firma', `¿Quieres eliminar "${sig.name}"?`, [
-      { text: 'Cancelar', style: 'cancel' },
-      {
-        text: 'Eliminar',
-        style: 'destructive',
-        onPress: () => {
-          deleteSignatureRecord(sig.id);
-          loadSaved();
+    Alert.alert(
+      'Eliminar firma',
+      `¿Quieres eliminar "${sig.name}"? También se quitará de los documentos donde esté colocada.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => {
+            deleteSignatureRecord(sig.id);
+            loadSaved();
+            onChanged?.();
+          },
         },
-      },
-    ]);
+      ],
+      { cancelable: true }
+    );
   };
 
   const handleSave = async () => {
@@ -186,6 +232,7 @@ export function SignaturePadModal({
       setName('');
       loadSaved();
       onCreated(record);
+      onChanged?.();
       onClose();
     } catch (err) {
       Alert.alert(
@@ -201,7 +248,10 @@ export function SignaturePadModal({
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <View style={[styles.container, { paddingTop: insets.top }]}>
+      <KeyboardAvoidingView
+        style={[styles.container, { paddingTop: insets.top }]}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
         {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity onPress={onClose} style={styles.headerBackBtn} hitSlop={10}>
@@ -220,10 +270,8 @@ export function SignaturePadModal({
               <ActivityIndicator size="small" color={COLORS.primary} />
             ) : (
               <Text
-                style={[
-                  styles.headerSaveText,
-                  !canSave && styles.headerSaveTextDisabled,
-                ]}
+                numberOfLines={1}
+                style={[styles.headerSaveText, !canSave && styles.headerSaveTextDisabled]}
               >
                 Guardar
               </Text>
@@ -240,7 +288,7 @@ export function SignaturePadModal({
               setActiveTab('saved');
             }}
           >
-            <Text style={[styles.tabText, activeTab === 'saved' && styles.tabTextActive]}>
+            <Text numberOfLines={1} style={[styles.tabText, activeTab === 'saved' && styles.tabTextActive]}>
               Guardadas ({savedSignatures.length})
             </Text>
           </TouchableOpacity>
@@ -252,7 +300,7 @@ export function SignaturePadModal({
               setActiveTab('new');
             }}
           >
-            <Text style={[styles.tabText, activeTab === 'new' && styles.tabTextActive]}>
+            <Text numberOfLines={1} style={[styles.tabText, activeTab === 'new' && styles.tabTextActive]}>
               Nueva firma
             </Text>
           </TouchableOpacity>
@@ -262,7 +310,7 @@ export function SignaturePadModal({
           <ScrollView
             contentContainerStyle={[
               styles.savedList,
-              { paddingBottom: Math.max(24, insets.bottom + 16) },
+              { paddingBottom: Math.max(24, safeBottom + 16) },
             ]}
           >
             {savedSignatures.length === 0 ? (
@@ -274,7 +322,9 @@ export function SignaturePadModal({
                   style={styles.emptySavedBtn}
                   onPress={() => setActiveTab('new')}
                 >
-                  <Text style={styles.emptySavedBtnText}>Nueva firma</Text>
+                  <Text numberOfLines={1} style={styles.emptySavedBtnText}>
+                    Nueva firma
+                  </Text>
                 </TouchableOpacity>
               </View>
             ) : (
@@ -307,7 +357,14 @@ export function SignaturePadModal({
             )}
           </ScrollView>
         ) : (
-          <View style={[styles.body, { paddingBottom: Math.max(20, insets.bottom + 10) }]}>
+          <ScrollView
+            scrollEnabled={!drawing}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={[
+              styles.body,
+              { paddingBottom: Math.max(20, safeBottom + 14) },
+            ]}
+          >
             {/* Clean Signature Drawing Canvas */}
             <View
               style={styles.canvasCard}
@@ -322,9 +379,9 @@ export function SignaturePadModal({
               <Svg style={StyleSheet.absoluteFill}>
                 <Line
                   x1={24}
-                  y1={canvasSize.height - 56}
+                  y1={canvasSize.height - 52}
                   x2={Math.max(25, canvasSize.width - 24)}
-                  y2={canvasSize.height - 56}
+                  y2={canvasSize.height - 52}
                   stroke="#CBD5E1"
                   strokeWidth={1.2}
                   strokeDasharray="6 5"
@@ -332,9 +389,9 @@ export function SignaturePadModal({
                 {strokes.map((s, idx) => (
                   <Path
                     key={idx}
-                    d={strokeToSvgPath(s)}
-                    stroke={inkColor}
-                    strokeWidth={strokeWidth}
+                    d={strokeToSvgPath(s.points)}
+                    stroke={s.color}
+                    strokeWidth={s.width}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     fill="none"
@@ -386,10 +443,7 @@ export function SignaturePadModal({
                           Haptics.selectionAsync().catch(() => {});
                           setInkColor(c.value);
                         }}
-                        style={[
-                          styles.swatchOuter,
-                          selected && styles.swatchOuterActive,
-                        ]}
+                        style={[styles.swatchOuter, selected && styles.swatchOuterActive]}
                       >
                         <View style={[styles.swatchDot, { backgroundColor: c.value }]} />
                       </TouchableOpacity>
@@ -413,10 +467,7 @@ export function SignaturePadModal({
                         style={[styles.widthPill, selected && styles.widthPillActive]}
                       >
                         <Text
-                          style={[
-                            styles.widthPillText,
-                            selected && styles.widthPillTextActive,
-                          ]}
+                          style={[styles.widthPillText, selected && styles.widthPillTextActive]}
                         >
                           {w.label}
                         </Text>
@@ -435,7 +486,9 @@ export function SignaturePadModal({
                 disabled={strokes.length === 0}
               >
                 <Ionicons name="arrow-undo-outline" size={17} color={COLORS.navy} />
-                <Text style={styles.pillActionText}>Deshacer</Text>
+                <Text numberOfLines={1} style={styles.pillActionText}>
+                  Deshacer
+                </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -444,12 +497,14 @@ export function SignaturePadModal({
                 disabled={strokes.length === 0}
               >
                 <Ionicons name="trash-outline" size={17} color={COLORS.danger} />
-                <Text style={[styles.pillActionText, { color: COLORS.danger }]}>Limpiar</Text>
+                <Text numberOfLines={1} style={[styles.pillActionText, { color: COLORS.danger }]}>
+                  Limpiar
+                </Text>
               </TouchableOpacity>
             </View>
-          </View>
+          </ScrollView>
         )}
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -510,6 +565,7 @@ const styles = StyleSheet.create({
     borderBottomColor: COLORS.primary,
   },
   tabText: {
+    flexShrink: 1,
     fontSize: 14,
     fontWeight: '600',
     color: COLORS.textSecondary,
@@ -519,14 +575,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   body: {
-    flex: 1,
+    flexGrow: 1,
     paddingHorizontal: 18,
     paddingTop: 18,
   },
   canvasCard: {
-    flex: 1,
-    minHeight: 230,
-    maxHeight: 340,
+    height: 240,
     backgroundColor: COLORS.surface,
     borderRadius: 18,
     borderWidth: 1,
@@ -551,7 +605,7 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 14,
     paddingHorizontal: 14,
-    height: 42,
+    height: 44,
     borderRadius: 12,
     backgroundColor: COLORS.surface,
     borderWidth: 1,
@@ -628,8 +682,7 @@ const styles = StyleSheet.create({
   bottomActions: {
     flexDirection: 'row',
     gap: 12,
-    marginTop: 'auto',
-    paddingTop: 20,
+    marginTop: 24,
   },
   pillActionBtn: {
     flex: 1,
@@ -649,7 +702,6 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.navy,
   },
-  // Saved tab
   savedList: {
     padding: 18,
     gap: 12,
@@ -704,18 +756,6 @@ const styles = StyleSheet.create({
     paddingTop: 64,
     paddingHorizontal: 28,
     gap: 10,
-  },
-  emptySavedIcon: {
-    width: 64,
-    height: 64,
-    borderRadius: 20,
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 4,
-    ...SHADOWS.card,
   },
   emptySavedTitle: {
     fontSize: 16,

@@ -8,9 +8,9 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import type { Folder } from '../types/models';
+import { useSafeBottom } from '../hooks/useSafeBottom';
 import { COLORS } from '../theme/colors';
 
 interface MoveFolderModalProps {
@@ -28,13 +28,13 @@ export function MoveFolderModal({
   onClose,
   onSelect,
 }: MoveFolderModalProps) {
-  const insets = useSafeAreaInsets();
+  const safeBottom = useSafeBottom();
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose}>
         <Pressable
-          style={[styles.sheet, { paddingBottom: Math.max(22, insets.bottom + 12) }]}
+          style={[styles.sheet, { paddingBottom: Math.max(22, safeBottom + 12) }]}
           onPress={() => {}}
         >
           <View style={styles.handle} />
